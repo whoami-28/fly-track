@@ -1,0 +1,23 @@
+# Core Computer Vision & Screen Capture
+mss>=10.2.0
+opencv-python>=4.10.0
+numpy>=1.24.0
+
+# Input Emulation
+pynput>=1.8.0
+
+# Configuration & Utilities
+python-dotenv>=1.0.0
+
+# Graph & Scientific Computing (For Milestones 3-4)
+scipy>=1.11.0
+networkx>=3.0
+
+# Drosophila Connectome (FlyWire / Codex) (For Milestone 3)
+# Note: Install via pip when setting up connectome pipeline
+# fafbseg
+# navis
+
+# Spiking Neural Network (SNN) & PyTorch (For Milestone 4)
+# torch
+# spikingjelly

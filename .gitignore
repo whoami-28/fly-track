@@ -1,0 +1,24 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Environment variables & secrets
+.env
+.env.local
+
+# Connectome and model cache files
+*.npz
+*.pt
+*.pth
+data/cache/
+data/connectome/
+
+# Game calibration
+calibration_config.json
+
+# Logs & temp benchmarks
+*.log
+scratch/

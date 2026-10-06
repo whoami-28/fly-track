@@ -27,6 +27,15 @@ from pynput.keyboard import Controller as KeyboardController, KeyCode
 
 import config
 
+# Reconfigure stdout/stderr to UTF-8 on Windows
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -61,46 +70,100 @@ class WindowRect:
         }
 
 
+def get_process_name_by_pid(pid: int) -> str:
+    """Retrieve process executable file name for a given process ID."""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        hproc = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not hproc:
+            return ""
+        buff = ctypes.create_unicode_buffer(512)
+        size = ctypes.wintypes.DWORD(512)
+        kernel32.QueryFullProcessImageNameW(hproc, 0, buff, ctypes.byref(size))
+        kernel32.CloseHandle(hproc)
+        return Path(buff.value).name.lower()
+    except Exception:
+        return ""
+
+
 def find_windows_by_keywords(keywords: List[str]) -> List[Tuple[int, str, WindowRect]]:
-    """Enumerate visible top-level windows matching any of the keyword substrings."""
+    """Enumerate visible windows matching keyword in title or process name across desktops."""
     matches: List[Tuple[int, str, WindowRect]] = []
+    seen_hwnds = set()
     user32 = ctypes.windll.user32
 
-    def enum_windows_proc(hwnd: int, lparam: int) -> bool:
-        if not user32.IsWindowVisible(hwnd):
+    def check_hwnd(hwnd: int, lparam: int) -> bool:
+        if hwnd in seen_hwnds:
             return True
+        seen_hwnds.add(hwnd)
+
+        if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+            return True
+
         length = user32.GetWindowTextLengthW(hwnd)
-        if length == 0:
-            return True
-        buff = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buff, length + 1)
-        title = buff.value
+        title = ""
+        if length > 0:
+            buff = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buff, length + 1)
+            title = buff.value
 
+        lpdwProcessId = ctypes.wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(lpdwProcessId))
+        pid = lpdwProcessId.value
+        proc_name = get_process_name_by_pid(pid)
+
+        matched = False
         for kw in keywords:
-            if kw.lower() in title.lower():
-                # Prefer client rect (canvas only, excluding Windows title bar & borders)
-                client_rect = ctypes.wintypes.RECT()
-                user32.GetClientRect(hwnd, ctypes.byref(client_rect))
-                pt = ctypes.wintypes.POINT(0, 0)
-                user32.ClientToScreen(hwnd, ctypes.byref(pt))
-                w = client_rect.right - client_rect.left
-                h = client_rect.bottom - client_rect.top
-
-                if w > 100 and h > 100:
-                    matches.append((hwnd, title, WindowRect(pt.x, pt.y, w, h)))
-                else:
-                    # Fallback to window rect if client rect is unavailable
-                    rect = ctypes.wintypes.RECT()
-                    user32.GetWindowRect(hwnd, ctypes.byref(rect))
-                    w_win = rect.right - rect.left
-                    h_win = rect.bottom - rect.top
-                    if w_win > 100 and h_win > 100:
-                        matches.append((hwnd, title, WindowRect(rect.left, rect.top, w_win, h_win)))
+            kw_low = kw.lower()
+            if (kw_low in title.lower()) or (kw_low in proc_name):
+                matched = True
                 break
+
+        if matched:
+            # Prefer client rect (canvas only, excluding Windows title bar & borders)
+            client_rect = ctypes.wintypes.RECT()
+            user32.GetClientRect(hwnd, ctypes.byref(client_rect))
+            pt = ctypes.wintypes.POINT(0, 0)
+            user32.ClientToScreen(hwnd, ctypes.byref(pt))
+            w = client_rect.right - client_rect.left
+            h = client_rect.bottom - client_rect.top
+
+            disp_title = title if title else f"PolyTrack ({proc_name})"
+            if w > 100 and h > 100:
+                matches.append((hwnd, disp_title, WindowRect(pt.x, pt.y, w, h)))
+            else:
+                rect = ctypes.wintypes.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                w_win = rect.right - rect.left
+                h_win = rect.bottom - rect.top
+                if w_win > 100 and h_win > 100:
+                    matches.append((hwnd, disp_title, WindowRect(rect.left, rect.top, w_win, h_win)))
         return True
 
     EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
-    user32.EnumWindows(EnumWindowsProc(enum_windows_proc), 0)
+    callback = EnumWindowsProc(check_hwnd)
+
+    # 1. First enumerate on OpenInputDesktop (interactive user desktop)
+    hinput = None
+    try:
+        hinput = user32.OpenInputDesktop(0, False, 0x0100)  # DESKTOP_ENUMERATE
+        if hinput:
+            user32.EnumDesktopWindows(hinput, callback, 0)
+    except Exception:
+        pass
+    finally:
+        if hinput:
+            try:
+                user32.CloseDesktop(hinput)
+            except Exception:
+                pass
+
+    # 2. Also run standard EnumWindows as supplement/fallback
+    try:
+        user32.EnumWindows(callback, 0)
+    except Exception:
+        pass
+
     return matches
 
 
@@ -541,6 +604,13 @@ class PolytrackHarness:
         windows = find_windows_by_keywords(config.WINDOW_TITLE_KEYWORDS)
         if not windows:
             logger.warning("No matching window found for Polytrack.")
+            print("\n" + "=" * 62)
+            print(" [ОШИБКА] Окно PolyTrack не найдено!")
+            print("=" * 62)
+            print(" 1. Запустите игру PolyTrack (Desktop-версию или в браузере).")
+            print(" 2. Убедитесь, что окно не свернуто в панель задач (не минимизировано).")
+            print(" 3. Запустите скрипт еще раз.")
+            print("=" * 62 + "\n")
             return False
 
         # Prefer windows explicitly containing Polytrack
@@ -548,9 +618,18 @@ class PolytrackHarness:
         target = polytrack_matches[0] if polytrack_matches else windows[0]
         hwnd, title, rect = target
 
-        logger.info(f"Target window detected: '{title}' (hwnd: {hwnd}, rect: {rect})")
+        print("\n" + "=" * 62)
+        print(" [УСПЕХ] ОКНО POLYTRACK НАЙДЕНО!")
+        print("=" * 62)
+        print(f" Заголовок:   '{title}'")
+        print(f" Дескриптор:  hwnd={hwnd}")
+        print(f" Координаты:  X={rect.left}, Y={rect.top}, Ширина={rect.width}, Высота={rect.height}")
+        print(f" Конфигурация сохранена в: {self.config_path.name}")
+        print("=" * 62 + "\n")
+
         bbox = rect.to_mss_dict()
         self.save_calibration(bbox, metadata={"window_title": title, "hwnd": hwnd})
+        focus_window(hwnd)
         return True
 
     def interactive_calibrate(self) -> bool:
@@ -810,7 +889,10 @@ def main() -> None:
         return
 
     if args.autofind:
-        harness.auto_calibrate_from_window()
+        success = harness.auto_calibrate_from_window()
+        if not success:
+            sys.exit(1)
+        sys.exit(0)
     if args.calibrate:
         harness.interactive_calibrate()
     if args.test_input:

@@ -79,8 +79,12 @@ RESPAWN_DETECTION_THRESHOLD = float(os.getenv("RESPAWN_DETECTION_THRESHOLD", "0.
 
 # Evolutionary Training Parameters (Module 5)
 BEST_BRAIN_WEIGHTS_FILE = DATA_DIR / "brain_weights_best.pt"
+PREVIOUS_BRAIN_WEIGHTS_FILE = DATA_DIR / "brain_weights_previous.pt"
+BASELINE_BRAIN_WEIGHTS_FILE = DATA_DIR / "brain_weights_baseline.pt"
+CHECKPOINTS_DIR = DATA_DIR / "checkpoints"
 EVOLUTION_MUTATION_SIGMA = float(os.getenv("EVOLUTION_MUTATION_SIGMA", "0.04"))
 EVOLUTION_POPULATION_SIZE = int(os.getenv("EVOLUTION_POPULATION_SIZE", "8"))
+
 
 
 

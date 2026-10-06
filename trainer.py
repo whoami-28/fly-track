@@ -101,6 +101,29 @@ class EvolutionaryTrainer:
             except Exception as e:
                 logger.warning(f"Could not restore checkpoint from {self.output_path}: {e}")
 
+    def _backup_current_weights(self) -> None:
+        """Create automatic backup of current brain weights before training modifies them."""
+        if not self.output_path.exists():
+            return
+        try:
+            import shutil
+
+            # 1. Update immediate rollback pointer: data/brain_weights_previous.pt
+            shutil.copy2(self.output_path, config.PREVIOUS_BRAIN_WEIGHTS_FILE)
+            logger.info(f"Created immediate rollback backup at {config.PREVIOUS_BRAIN_WEIGHTS_FILE}")
+
+            # 2. Archive to historical checkpoints folder: data/checkpoints/brain_weights_...
+            config.CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
+            timestamp_str = time.strftime("%Y%m%d_%H%M%S")
+            fit_val = self.best_fitness if self.best_fitness != -float("inf") else 0.0
+            fit_str = f"{fit_val:.1f}".replace("-", "neg")
+            archive_name = f"brain_weights_{timestamp_str}_gen{self.best_generation}_fit{fit_str}.pt"
+            archive_path = config.CHECKPOINTS_DIR / archive_name
+            shutil.copy2(self.output_path, archive_path)
+            logger.info(f"Archived previous session checkpoint to {archive_path}")
+        except Exception as e:
+            logger.warning(f"Could not backup existing weights: {e}")
+
     def evaluate_candidate(
         self,
         candidate_params: np.ndarray,
@@ -344,8 +367,11 @@ class EvolutionaryTrainer:
         print(f"Plastic Parameters: {self.n_params:,}")
         print(f"Generations: {num_generations} | Mode: {'SYNTHETIC' if self.use_synthetic else 'LIVE DESKTOP POLYTRACK'}")
         print(f"Active Checkpoint: {self.output_path}")
-        print(f"Current Best Fitness Anchor: {self.best_fitness:.2f} (Gen {self.best_generation})")
+        print("Current Best Fitness Anchor: " f"{self.best_fitness:.2f} (Gen {self.best_generation})")
         print("=" * 68)
+
+        # Automatic backup of current weights before training modifies them
+        self._backup_current_weights()
 
         # If baseline fitness is unknown, evaluate champion once before starting
         if self.best_fitness == -float("inf"):

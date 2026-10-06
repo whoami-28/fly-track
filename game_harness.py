@@ -240,6 +240,16 @@ class ScreenCapture:
     """
 
     def __init__(self, bbox: Optional[Dict[str, int]] = None, fallback_synthetic: bool = False) -> None:
+        # On Windows, attach thread to active interactive desktop so BitBlt always succeeds
+        try:
+            user32 = ctypes.windll.user32
+            hinput = user32.OpenInputDesktop(0, False, 0x01FF)
+            if hinput:
+                user32.SetThreadDesktop(hinput)
+                user32.CloseDesktop(hinput)
+        except Exception:
+            pass
+
         self.sct = mss.MSS() if hasattr(mss, "MSS") else mss.mss()
         self.bbox = bbox or config.DEFAULT_BBOX.copy()
         self.fallback_synthetic = fallback_synthetic

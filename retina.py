@@ -563,18 +563,32 @@ class RetinaVisualizer:
         return vis
 
 
-def run_live_retina_stream(use_synthetic: bool = True) -> None:
+def run_live_retina_stream(use_synthetic: bool = False) -> None:
     """Run an interactive real-time visual stream of the retina dashboard."""
     from game_harness import PolytrackHarness, ScreenCapture
 
     print("\n" + "=" * 60)
     print("STARTING DROSOPHILA RETINA DASHBOARD STREAM")
-    print(f"Mode: {'SYNTHETIC POLYTRACK SIMULATION' if use_synthetic else 'LIVE SCREEN CAPTURE'}")
+    print(f"Mode: {'SYNTHETIC POLYTRACK SIMULATION' if use_synthetic else 'LIVE SCREEN CAPTURE (REAL GAME)'}")
     print("Press 'q' or ESC in preview window to exit.")
     print("Press 's' to save a dashboard screenshot to disk.")
+    print("Press 'r' to reset temporal filters.")
     print("=" * 60 + "\n")
 
     harness = PolytrackHarness(fallback_synthetic=use_synthetic)
+
+    # If live screen requested, ensure calibration exists or auto-detect window
+    if not use_synthetic:
+        if not harness.config_path.exists():
+            print("[INFO] Калибровка окна не найдена. Поиск окна PolyTrack...")
+            success = harness.auto_calibrate()
+            if not success:
+                print("[WARNING] Окно PolyTrack не обнаружено! Переключение в синтетический режим.")
+                use_synthetic = True
+                harness = PolytrackHarness(fallback_synthetic=True)
+        else:
+            print(f"[OK] Загружена калибровка окна PolyTrack: {harness.bbox}")
+
     retina = DrosophilaRetina()
     visualizer = RetinaVisualizer()
 
@@ -589,19 +603,28 @@ def run_live_retina_stream(use_synthetic: bool = True) -> None:
         while True:
             # Step 1: Capture game frame
             if use_synthetic:
-                # Add gentle camera yaw swing to demonstrate optical flow
                 frame_count += 1
                 phase = frame_count * 0.05
-                is_falling = (frame_count // 300) % 2 == 1  # Periodic test fall
+                is_falling = (frame_count // 300) % 2 == 1
                 frame_bgr = ScreenCapture.generate_synthetic_polytrack_frame(800, 600, is_falling=is_falling)
-                # Simulate steering displacement
                 shift = int(np.sin(phase) * 30.0)
                 M = np.float32([[1, 0, shift], [0, 1, 0]])
                 frame_bgr = cv2.warpAffine(frame_bgr, M, (800, 600), borderMode=cv2.BORDER_REFLECT)
-                telemetry = {"is_falling": is_falling, "synthetic": True}
+                telemetry = {"is_falling": is_falling, "synthetic": True, "latency_capture_ms": 0.5}
             else:
-                frame_bgr, _ = harness.capture.grab_bgr()
-                _, is_falling, telemetry = harness.step()
+                frame_bgr, cap_ms = harness.capture.grab_bgr()
+                is_terminal, is_falling, is_respawn, lap_var, prompt_score = harness.state_detector.detect_fall_or_crash(frame_bgr)
+                hud_delta = harness.state_detector.check_hud_activity(frame_bgr)
+                telemetry = {
+                    "latency_capture_ms": cap_ms,
+                    "is_terminal": is_terminal,
+                    "is_falling": is_falling,
+                    "is_respawn_prompt": is_respawn,
+                    "laplacian_var": lap_var,
+                    "hud_delta": hud_delta,
+                    "prompt_score": prompt_score,
+                    "synthetic": False,
+                }
 
             # Step 2: Drosophila visual processing
             retina_out = retina.process(frame_bgr)
@@ -614,12 +637,12 @@ def run_live_retina_stream(use_synthetic: bool = True) -> None:
             if key in [ord("q"), 27]:  # 'q' or ESC
                 break
             elif key == ord("s"):
-                snap_path = config.BASE_DIR / f"retina_snapshot_{int(time.time())}.png"
+                snap_path = config.DATA_DIR / f"retina_snapshot_{int(time.time())}.png"
                 cv2.imwrite(str(snap_path), dashboard)
-                print(f"[SAVED] Retina dashboard snapshot saved to: {snap_path}")
+                print(f"[SAVED] Скриншот дашборда сохранен в: {snap_path}")
             elif key == ord("r"):
                 retina.reset()
-                print("[RESET] Retina temporal filters reset.")
+                print("[RESET] Временные фильтры сетчатки сброшены.")
 
     finally:
         harness.inputs.release_all()
@@ -628,18 +651,136 @@ def run_live_retina_stream(use_synthetic: bool = True) -> None:
         print(f"\nRetina stream closed. Average frame rate: {fps:.1f} FPS.")
 
 
+def run_retina_sight_diagnostic() -> bool:
+    """Comprehensive diagnostic verifying the fly's vision receives and processes live game frames.
+    
+    Generates data/fly_sight_diagnostic.png containing:
+    1. Real PolyTrack game capture
+    2. Binocular ommatidia luminance heatmap (16x32)
+    3. ON / OFF photoreceptor channels
+    4. Full retinal dashboard & spike raster
+    """
+    from game_harness import PolytrackHarness, ScreenCapture
+
+    print("\n" + "=" * 65)
+    print("     ДИАГНОСТИКА ЗРЕНИЯ ДРОЗОФИЛЫ (FLY EYE & RETINA DIAGNOSTIC)")
+    print("=" * 65)
+
+    harness = PolytrackHarness(fallback_synthetic=False)
+    if not harness.config_path.exists():
+        print(" [!] Калибровка не найдена. Выполняется автопоиск окна PolyTrack...")
+        if not harness.auto_calibrate():
+            print(" [ОШИБКА] Окно PolyTrack не найдено! Запустите игру PolyTrack.")
+            return False
+
+    # 1. Capture real live frame
+    t0 = time.perf_counter()
+    frame_bgr, cap_ms = harness.capture.grab_bgr()
+    h, w = frame_bgr.shape[:2]
+
+    # Verify frame is valid
+    mean_val = float(np.mean(frame_bgr))
+    std_val = float(np.std(frame_bgr))
+
+    # 2. Process with Retina
+    retina = DrosophilaRetina()
+    # Warmup temporal filters with 3 frames
+    for _ in range(3):
+        out = retina.process(frame_bgr)
+
+    # 3. Analyze metrics
+    num_ommatidia = out.ommatidia_luminance.size
+    lum_min = float(np.min(out.ommatidia_luminance))
+    lum_max = float(np.max(out.ommatidia_luminance))
+    lum_mean = float(np.mean(out.ommatidia_luminance))
+    lum_std = float(np.std(out.ommatidia_luminance))
+
+    on_mean = float(np.mean(out.on_channel))
+    off_mean = float(np.mean(out.off_channel))
+    num_spikes = int(np.sum(out.spikes))
+    total_stim = int(np.sum(out.stimulation_currents > 0))
+
+    # 4. Generate diagnostic collage
+    visualizer = RetinaVisualizer()
+    telemetry = {
+        "latency_capture_ms": cap_ms,
+        "is_terminal": False,
+        "is_falling": False,
+        "is_respawn_prompt": False,
+        "laplacian_var": 100.0,
+        "hud_delta": 0.0,
+        "synthetic": False,
+    }
+    dashboard = visualizer.render_dashboard(frame_bgr, out, telemetry)
+
+    # Create top comparison pane: Raw Game Frame vs Ommatidia Eyes
+    top_w = 1280
+    top_h = 360
+    top_pane = np.zeros((top_h, top_w, 3), dtype=np.uint8)
+
+    # Raw frame resized to fit left half
+    raw_fit = cv2.resize(frame_bgr, (top_w // 2 - 20, top_h - 40), interpolation=cv2.INTER_AREA)
+    top_pane[30:30 + raw_fit.shape[0], 10:10 + raw_fit.shape[1]] = raw_fit
+    cv2.putText(top_pane, f"1. Реальное окно PolyTrack ({w}x{h} px, cap={cap_ms:.1f}ms)", (15, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 200), 1)
+
+    # Ommatidia heatmap resized to fit right half
+    omm_u8 = (np.clip(out.ommatidia_luminance, 0, 1) * 255).astype(np.uint8)
+    omm_color = cv2.applyColorMap(omm_u8, cv2.COLORMAP_VIRIDIS)
+    omm_fit = cv2.resize(omm_color, (top_w // 2 - 20, top_h - 40), interpolation=cv2.INTER_NEAREST)
+    top_pane[30:30 + omm_fit.shape[0], top_w // 2 + 10:top_w // 2 + 10 + omm_fit.shape[1]] = omm_fit
+    cv2.putText(top_pane, f"2. Сетчатка мухи: 512 омматидиев (Luminance Mean={lum_mean:.2f})", (top_w // 2 + 15, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 200), 1)
+
+    # Stack top pane and dashboard
+    diag_collage = np.vstack([top_pane, cv2.resize(dashboard, (top_w, 720))])
+
+    # Save to disk
+    out_file = config.DATA_DIR / "fly_sight_diagnostic.png"
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out_file), diag_collage)
+
+    # 5. Output Report
+    print(f" [1] Захват экрана:        УСПЕШНО ({w}x{h} px, задержка={cap_ms:.2f} мс)")
+    print(f" [2] Окно PolyTrack:       Дескриптор hwnd={harness.bbox.get('hwnd', 'активно')}")
+    print(f" [3] Средняя яркость BGR:  {mean_val:.1f} (std={std_val:.1f})")
+    print(f" [4] Омматидии сетчатки:   512 шт (16x32 бинокулярная решетка)")
+    print(f"     - Диапазон яркости:   [{lum_min:.3f} ... {lum_max:.3f}], средняя={lum_mean:.3f}")
+    print(f"     - Динамика контраста: std={lum_std:.3f}")
+    print(f" [5] Фоторецепторы ON/OFF: ON_mean={on_mean:.3f}, OFF_mean={off_mean:.3f}")
+    print(f" [6] Детекторы движения:   HRC EMD-X={out.lptc_yaw_signal:+.3f}, VS-Forward={out.lptc_vs_forward:+.3f}")
+    print(f" [7] Спайковый энкодер:    {total_stim} активных входных каналов -> {num_spikes} спайков за кадр")
+    print(f" [8] Коллаж доказательства: {out_file.name}")
+    print("=" * 65)
+
+    is_seeing = (mean_val > 5.0) and (std_val > 5.0) and (lum_std > 0.01) and (num_spikes > 10)
+    if is_seeing:
+        print(" >>> ВЕРДИКТ: ГЛАЗА И СЕТЧАТКА МУХИ РАБОТАЮТ НА 100%! МУХА ВИДИТ ИГРУ! <<<")
+    else:
+        print(" >>> ВЕРДИКТ: ПРЕДУПРЕЖДЕНИЕ: Кадр слишком однородный или пустой! <<<")
+    print("=" * 65 + "\n")
+
+    return is_seeing
+
+
 def main() -> None:
     """CLI entrypoint for testing and visualizing the Drosophila retina."""
     parser = argparse.ArgumentParser(description="Drosophila Retina & Motion Correlator (Module 2)")
     parser.add_argument("--stream", action="store_true", help="Launch live retina visual dashboard")
-    parser.add_argument("--live-screen", action="store_true", help="Capture live desktop instead of synthetic")
+    parser.add_argument("--live-screen", action="store_true", default=False, help="Capture live desktop window")
+    parser.add_argument("--synthetic", action="store_true", help="Force synthetic simulation instead of live screen")
+    parser.add_argument("--check-sight", action="store_true", help="Run comprehensive Drosophila sight diagnostic")
     parser.add_argument("--benchmark", action="store_true", help="Benchmark retina computation throughput")
     parser.add_argument("--save-snapshot", action="store_true", help="Save a single snapshot image of dashboard")
     parser.add_argument("--cycles", type=int, default=300, help="Benchmark cycles")
 
     args = parser.parse_args()
 
-    if args.benchmark or (not args.stream and not args.save_snapshot):
+    if args.check_sight:
+        run_retina_sight_diagnostic()
+        return
+
+    if args.benchmark or (not args.stream and not args.save_snapshot and not args.check_sight):
         # Run computational benchmark by default
         print("\n" + "=" * 60)
         print(f"BENCHMARKING DROSOPHILA RETINA PIPELINE ({args.cycles} CYCLES)")
@@ -698,8 +839,11 @@ def main() -> None:
         print(f"[OK] Saved retina dashboard demo to: {out_path}")
 
     if args.stream:
-        run_live_retina_stream(use_synthetic=not args.live_screen)
+        # If synthetic flag was explicitly passed, use synthetic; otherwise default to live screen
+        use_synth = args.synthetic or (not args.live_screen and not config.CALIBRATION_FILE.exists())
+        run_live_retina_stream(use_synthetic=use_synth)
 
 
 if __name__ == "__main__":
     main()
+

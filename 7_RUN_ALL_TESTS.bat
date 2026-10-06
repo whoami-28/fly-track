@@ -1,47 +1,53 @@
 @echo off
 chcp 65001 > nul
 cd /d "%~dp0"
-title Polytrack Drosophila - System Test Suite
+title Polytrack Drosophila - Запуск всех тестов
 
 echo ===================================================================
-echo     ЗАПУСК ПОЛНОГО НАБОРА ТЕСТОВ (Все модули контура мухи)
+echo       ЗАПУСК ПОЛНОГО КОМПЛЕКСА ТЕСТОВ СИСТЕМЫ (MODULES 1-5)
 echo ===================================================================
 echo.
-echo [1/5] Тестирование модуля захвата и детекции (test_harness.py)...
+
+echo [1/6] Тестирование захвата и эмулятора (game_harness)...
 python test_harness.py
-if errorlevel 1 goto error
+if errorlevel 1 goto failed
 
 echo.
-echo [2/5] Тестирование сетчатки и оптического потока (test_retina.py)...
+echo [2/6] Тестирование сетчатки и оптического потока (retina)...
 python test_retina.py
-if errorlevel 1 goto error
+if errorlevel 1 goto failed
 
 echo.
-echo [3/5] Тестирование загрузчика коннектома FlyWire (test_connectome.py)...
+echo [3/6] Тестирование графа коннектома FlyWire (connectome_loader)...
 python test_connectome.py
-if errorlevel 1 goto error
+if errorlevel 1 goto failed
 
 echo.
-echo [4/5] Тестирование спайковой нейросети LIF (test_brain.py)...
+echo [4/6] Тестирование спайкового мозга дрозофилы (fly_brain)...
 python test_brain.py
-if errorlevel 1 goto error
+if errorlevel 1 goto failed
 
 echo.
-echo [5/5] Интеграционное тестирование всей системы (test_system.py)...
+echo [5/6] Тестирование менеджера весов и сброса мозга (brain_manager)...
+python test_brain_manager.py
+if errorlevel 1 goto failed
+
+echo.
+echo [6/6] Тестирование системного контура и тренера (system & trainer)...
 python test_system.py
-if errorlevel 1 goto error
+if errorlevel 1 goto failed
 
 echo.
 echo ===================================================================
-echo        ВСЕ ТЕСТЫ УСПЕШНО ПРОЙДЕНЫ! (100%% PASS)
+echo       ВСЕ ТЕСТЫ ПРОЙДЕНЫ УСПЕШНО! СИСТЕМА ПОЛНОСТЬЮ ИСПРАВНА.
 echo ===================================================================
 goto end
 
-:error
+:failed
 echo.
-echo !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-echo                     ОБНАРУЖЕНА ОШИБКА В ТЕСТАХ
-echo !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+echo ===================================================================
+echo    ОШИБКА: ОБНАРУЖЕНЫ СБОИ В ОДНОМ ИЛИ НЕСКОЛЬКИХ МОДУЛЯХ!
+echo ===================================================================
 
 :end
 echo.

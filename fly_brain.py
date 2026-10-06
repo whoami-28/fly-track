@@ -396,26 +396,49 @@ class FlyBrain(nn.Module):
             p.data.copy_(torch.from_numpy(chunk.reshape(p.shape)).float().to(self.device))
             idx += n_el
 
-    def save_weights(self, filepath: Path) -> None:
-        """Save plastic adapter weights to .pt file."""
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "input_adapter": self.input_adapter.state_dict(),
-                "motor_decoder": self.motor_decoder.state_dict(),
+    def reset_to_baseline(self) -> None:
+        """Reset plastic layers (Input Adapter & Motor Decoder) to default biological baseline weights."""
+        self.input_adapter._init_biological_weights()
+        self.motor_decoder._init_readout_weights()
+        logger.info("FlyBrain plastic layers reset to biological baseline weights.")
+
+    def save_baseline(self, filepath: Optional[Path] = None) -> Path:
+        """Save clean biological baseline weights to disk."""
+        target_path = filepath or config.DATA_DIR / "brain_weights_baseline.pt"
+        self.reset_to_baseline()
+        self.save_weights(
+            target_path,
+            metadata={
+                "type": "biological_baseline",
+                "best_fitness": 0.0,
+                "generation": 0,
+                "saved_at": time.time(),
+                "description": "Default physiological initial weights (receptive fields + motor thresholds)",
             },
-            filepath,
         )
+        return target_path
+
+    def save_weights(self, filepath: Path, metadata: Optional[Dict[str, Any]] = None) -> None:
+        """Save plastic adapter weights to .pt file with optional metadata."""
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        data: Dict[str, Any] = {
+            "input_adapter": self.input_adapter.state_dict(),
+            "motor_decoder": self.motor_decoder.state_dict(),
+        }
+        if metadata:
+            data.update(metadata)
+        torch.save(data, filepath)
         logger.info(f"Saved brain plastic weights to {filepath}")
 
-    def load_weights(self, filepath: Path) -> None:
-        """Load plastic adapter weights from .pt file."""
+    def load_weights(self, filepath: Path) -> Dict[str, Any]:
+        """Load plastic adapter weights from .pt file. Returns checkpoint dictionary."""
         if not filepath.exists():
             raise FileNotFoundError(f"Weight file not found: {filepath}")
         ckpt = torch.load(filepath, map_location=self.device)
         self.input_adapter.load_state_dict(ckpt["input_adapter"])
         self.motor_decoder.load_state_dict(ckpt["motor_decoder"])
         logger.info(f"Loaded brain plastic weights from {filepath}")
+        return ckpt
 
 
 def benchmark_fly_brain(cycles: int = 500) -> Dict[str, Any]:

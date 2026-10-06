@@ -228,9 +228,9 @@ class PlasticMotorDecoder(nn.Module):
             self.readout.weight.data[3, 0] = -1.5  # DNa01_L
 
             # Threshold biases
-            self.readout.bias.data[0] = +0.5  # W bias: positive baseline throttle drive
+            self.readout.bias.data[0] = +1.5  # W bias: strong positive throttle drive by default
             self.readout.bias.data[1] = -0.4  # A bias
-            self.readout.bias.data[2] = -1.0  # S bias: naturally inhibited brake
+            self.readout.bias.data[2] = -1.5  # S bias: naturally inhibited brake
             self.readout.bias.data[3] = -0.4  # D bias
 
     def decode(
@@ -243,7 +243,7 @@ class PlasticMotorDecoder(nn.Module):
         Constraint:
         In Polytrack, 'S' engages reverse gear if the car is stationary or moving backward.
         Therefore, 'S' is strictly prohibited at standstill / reverse, and can ONLY be engaged:
-        1. As a decelerating brake when forward velocity is positive (vs_forward > 0.05).
+        1. As a decelerating brake when forward velocity is positive (vs_forward > 0.003).
         2. As a drift / power-slide initiator when combined with steering (A/D) at speed.
         """
         # Logits: (Batch, 4)
@@ -260,28 +260,25 @@ class PlasticMotorDecoder(nn.Module):
         steer_d = prob_d > 0.5 and (prob_d > prob_a)
         is_turning = steer_a or steer_d
 
-        # Brake/Drift constraint:
-        # Car must have positive forward momentum (vs_forward > 0.05) to be physically allowed to brake or drift.
-        # From standstill (vs_forward <= 0.05), 'S' is strictly locked out (preventing reverse gear).
-        can_brake = vs_forward > 0.05
-        allow_s = can_brake and (prob_s > 0.5)
+        # Forward throttle W is the default mode of racing (car never stops accelerating by default)
+        action_w = bool(prob_w > 0.25)
 
+        # Brake / Drift constraint:
+        # Car must have positive forward momentum (vs_forward > 0.003) to be physically allowed to brake or drift.
+        # From standstill (vs_forward <= 0.003), 'S' is strictly locked out (preventing reverse gear).
+        can_brake = vs_forward > 0.003
         if not can_brake:
-            # At start line or standstill: throttle forward, lock out reverse S
-            action_w = bool(prob_w > 0.35)
             action_s = False
         else:
             if is_turning:
                 # In turns: allow simultaneous W and S for drifting / power sliding!
-                action_w = bool(prob_w > 0.45)
-                action_s = bool(allow_s)
+                action_s = bool(prob_s > 0.55)
             else:
-                # On straights: W and S are mutually exclusive
-                if allow_s and (prob_s > prob_w):
+                # On straights: heavy braking cuts throttle
+                if prob_s > 0.65 and prob_s > prob_w:
                     action_w = False
                     action_s = True
                 else:
-                    action_w = bool(prob_w > 0.45)
                     action_s = False
 
         actions = {

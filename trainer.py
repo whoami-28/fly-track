@@ -206,34 +206,33 @@ class EvolutionaryTrainer:
             # ---------------------------------------------------------
             brain_out = self.brain.forward_frame(retina_out.stimulation_currents, vs_forward=vs_forward)
 
+            # Check HUD timer activity (proves race is actively ticking in live game)
+            hud_delta = 0.0
+            if not self.use_synthetic:
+                hud_delta = self.harness.state_detector.check_hud_activity(frame_bgr)
+
             # Track directional movement
+            is_moving_forward = False
             if self.use_synthetic:
-                # In synthetic mode, pressing W simulates forward velocity
                 if brain_out.actions["w"]:
-                    sim_speed = 0.45
-                    positive_forward_frames += 1
-                    cumulative_forward_speed += sim_speed
-                else:
-                    still_speed = 0.0
+                    is_moving_forward = True
+                    cumulative_forward_speed += 0.45
             else:
-                if vs_forward > 0.02:
-                    positive_forward_frames += 1
-                    cumulative_forward_speed += vs_forward
-                elif vs_forward < -0.01:
-                    reverse_frames += 1
+                # In live game: car moves forward if throttle is engaged, HUD timer ticks, or optical flow > 0
+                if brain_out.actions["w"] or hud_delta > 0.05 or vs_forward > 0.001:
+                    is_moving_forward = True
+                    cumulative_forward_speed += max(0.0, vs_forward)
 
-            # TERMINATION CHECK 3: Anti-Reverse & Anti-Stagnation
-            # If the car starts going backwards or stands still for too long, abort!
-            if total_frames == 45 and not self.use_synthetic:
-                if positive_forward_frames < 6 or reverse_frames > 15:
+            if is_moving_forward:
+                positive_forward_frames += 1
+
+            # Only flag true idle standing if the car literally never touched throttle
+            # and HUD timer never started after 120 frames (2 full seconds)
+            if total_frames == 120 and not self.use_synthetic:
+                if positive_forward_frames < 10:
                     is_alive = False
-                    death_reason = "stagnation_or_reverse"
+                    death_reason = "did_not_start"
                     break
-
-            if reverse_frames >= 25 and not self.use_synthetic:
-                is_alive = False
-                death_reason = "reversing"
-                break
 
             # ---------------------------------------------------------
             # 4. Actuation (WASD dispatch)
@@ -253,34 +252,26 @@ class EvolutionaryTrainer:
                 self.harness.inputs.reset_game()
 
         # -------------------------------------------------------------
-        # 5. Composite Fitness Scoring: Forward Progress Optimization
+        # 5. Composite Fitness Scoring: Pure Forward Racing Rewards
         # -------------------------------------------------------------
-        forward_ratio = positive_forward_frames / max(1, total_frames)
-        avg_speed = cumulative_forward_speed / max(1, total_frames)
+        # Every frame the car races and stays on track without crashing earns points!
+        track_time_score = float(total_frames)
+        forward_motion_bonus = float(positive_forward_frames * 0.5)
+        flow_speed_score = float(cumulative_forward_speed * 10.0)
 
-        # Distance & Speed rewards
-        distance_score = float(cumulative_forward_speed * 12.0)
-        speed_score = float(avg_speed * 80.0)
+        crash_penalty = 35.0 if not is_alive and death_reason != "survived" else 0.0
 
-        # Survival points: ONLY rewarded if actively driving forward!
-        # Standing still or reversing gives 0 survival points.
-        survival_fraction = total_frames / float(self.max_frames)
-        survival_score = float(survival_fraction * 80.0 * forward_ratio)
-
-        # Penalties:
-        crash_penalty = 40.0 if not is_alive else 0.0
-        reverse_penalty = 50.0 if (death_reason in ["reversing", "stagnation_or_reverse"] or reverse_frames > 12) else 0.0
-
-        fitness = distance_score + speed_score + survival_score - crash_penalty - reverse_penalty
+        if death_reason == "did_not_start":
+            fitness = 0.0
+        else:
+            fitness = max(1.0, track_time_score + forward_motion_bonus + flow_speed_score - crash_penalty)
 
         metrics = {
             "fitness": float(fitness),
             "survival_frames": total_frames,
-            "survival_fraction": float(survival_fraction),
+            "survival_fraction": float(total_frames / float(self.max_frames)),
             "positive_forward_frames": positive_forward_frames,
-            "reverse_frames": reverse_frames,
-            "forward_ratio": float(forward_ratio),
-            "avg_speed": float(avg_speed),
+            "avg_speed": float(cumulative_forward_speed / max(1, total_frames)),
             "is_alive": bool(is_alive),
             "death_reason": death_reason,
             "max_prompt_score": float(max_prompt_score),

@@ -57,6 +57,7 @@ def test_motor_decoder_actions() -> None:
     assert isinstance(actions, dict)
     assert set(actions.keys()) == {"w", "a", "s", "d"}
     assert actions["s"] is False, "S must NEVER be engaged from a standstill (cannot reverse)!"
+    assert actions["w"] is True, "W must be engaged by default from standstill to drive forward!"
     for k in ["w", "a", "s", "d"]:
         assert 0.0 <= probs[k] <= 1.0
 

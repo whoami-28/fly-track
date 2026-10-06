@@ -263,10 +263,24 @@ class ScreenCapture:
         height: int,
         is_falling: bool = False,
         has_respawn_banner: bool = False,
+        biome: str = "summer",
     ) -> np.ndarray:
         """Generate a realistic synthetic Polytrack frame for testing and calibration validation."""
         # Sky background (light cyan/sky tone)
         frame = np.full((height, width, 3), (235, 206, 135), dtype=np.uint8)
+
+        if is_falling:
+            # Polytrack Abyss / Floor background according to seasonal biome:
+            # Summer = Green, Desert = Orange-Brown, Winter = White
+            if biome == "summer":
+                floor_color = (55, 155, 60)       # Green grass
+            elif biome == "desert":
+                floor_color = (35, 110, 205)      # Orange-brown sand
+            elif biome == "winter":
+                floor_color = (245, 245, 250)     # Snow white
+            else:
+                floor_color = (235, 206, 135)
+            frame[int(height * 0.35) :, :] = floor_color
 
         if not is_falling:
             # Draw perspective road polygon
@@ -443,6 +457,8 @@ class GameStateDetector:
         self.prompt_threshold = prompt_threshold
         self.fall_streak: int = 0
         self.last_hud_snapshot: Optional[np.ndarray] = None
+        self.last_detected_biome: str = "neutral_track"
+        self.last_floor_ratio: float = 0.0
         self.template_dir = template_dir or config.TEMPLATES_DIR
 
         # Pre-load grayscale templates for rapid template matching
@@ -512,6 +528,51 @@ class GameStateDetector:
         is_detected = best_score >= self.prompt_threshold
         return is_detected, best_score
 
+    def check_biome_floor_dominance(self, frame_bgr: np.ndarray) -> Tuple[bool, str, float]:
+        """Detect dominant floor background when car falls off track into the abyss.
+
+        Supports all 3 seasonal biomes of Polytrack:
+        1. Summer (Летние): Green grass/plain floor (HSV: H in [35, 85], S > 30, V > 40)
+        2. Desert (Пустынные): Orange-brown sand/canyon floor (HSV: H in [8, 28], S > 35, V > 50)
+        3. Winter (Зимние): White snow/ice floor (HSV: S < 35, V > 195)
+
+        Analyzes the road region (lower 60% of the frame).
+        Returns: (is_floor_dominated, detected_biome, max_coverage_ratio)
+        """
+        h, w = frame_bgr.shape[:2]
+        # Crop lower 60% where track normally sits
+        ground_roi = frame_bgr[int(h * 0.40) :, :]
+        # Downscale for ultra-fast color analysis (< 0.2 ms)
+        small_ground = cv2.resize(ground_roi, (80, 60), interpolation=cv2.INTER_NEAREST)
+        hsv = cv2.cvtColor(small_ground, cv2.COLOR_BGR2HSV)
+        total_pixels = small_ground.shape[0] * small_ground.shape[1]
+
+        # 1. Summer: Green floor
+        mask_summer = cv2.inRange(hsv, np.array([35, 30, 40], dtype=np.uint8), np.array([85, 255, 255], dtype=np.uint8))
+        ratio_summer = cv2.countNonZero(mask_summer) / float(total_pixels)
+
+        # 2. Desert: Orange-Brown floor
+        mask_desert = cv2.inRange(hsv, np.array([8, 35, 50], dtype=np.uint8), np.array([28, 255, 255], dtype=np.uint8))
+        ratio_desert = cv2.countNonZero(mask_desert) / float(total_pixels)
+
+        # 3. Winter: White snow floor
+        mask_winter = cv2.inRange(hsv, np.array([0, 0, 195], dtype=np.uint8), np.array([180, 35, 255], dtype=np.uint8))
+        ratio_winter = cv2.countNonZero(mask_winter) / float(total_pixels)
+
+        max_ratio = max(ratio_summer, ratio_desert, ratio_winter)
+        if ratio_summer == max_ratio and ratio_summer > 0.10:
+            biome = "summer_green"
+        elif ratio_desert == max_ratio and ratio_desert > 0.10:
+            biome = "desert_orange_brown"
+        elif ratio_winter == max_ratio and ratio_winter > 0.10:
+            biome = "winter_white"
+        else:
+            biome = "neutral_track"
+
+        # Threshold: if floor color covers >= 65% of the road area, the road is lost
+        is_dominated = max_ratio >= 0.65
+        return is_dominated, biome, float(max_ratio)
+
     def detect_fall_or_crash(
         self,
         frame_bgr: np.ndarray,
@@ -529,8 +590,14 @@ class GameStateDetector:
     def detect_fall(self, frame_bgr: np.ndarray) -> Tuple[bool, float]:
         """Detect if the car has fallen off the track.
 
-        Method: Polytrack tracks contain high-contrast geometric road boundaries and texture.
-        When falling into the sky or void, spatial edge variance (Laplacian variance) collapses.
+        Method:
+        1. When falling into empty void or sky, spatial edge variance (Laplacian variance) collapses.
+        2. When falling towards the floor in Polytrack, the lower screen is dominated by the
+           seasonal biome floor color:
+           - Summer: Green grass/plain floor
+           - Desert: Orange-brown sand floor
+           - Winter: White snow/ice floor
+
         Returns: (is_falling, laplacian_variance)
         """
         # Downsample frame for fast variance calculation
@@ -539,7 +606,16 @@ class GameStateDetector:
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
-        if lap_var < self.variance_threshold:
+        is_floor_dominated, biome, floor_ratio = self.check_biome_floor_dominance(frame_bgr)
+        self.last_detected_biome = biome
+        self.last_floor_ratio = floor_ratio
+
+        # Fall occurs if:
+        # - General edge variance collapses (< threshold), OR
+        # - Floor color dominates the road view (>= 65%) with low road edge variance
+        is_fall_frame = (lap_var < self.variance_threshold) or (is_floor_dominated and lap_var < self.variance_threshold * 1.5)
+
+        if is_fall_frame:
             self.fall_streak += 1
         else:
             self.fall_streak = max(0, self.fall_streak - 1)

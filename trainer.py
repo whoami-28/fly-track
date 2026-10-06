@@ -146,6 +146,8 @@ class EvolutionaryTrainer:
 
         total_frames = 0
         cumulative_forward_speed = 0.0
+        positive_forward_frames = 0
+        reverse_frames = 0
         consecutive_falls = 0
         is_alive = True
         death_reason = "survived"
@@ -159,11 +161,10 @@ class EvolutionaryTrainer:
             # ---------------------------------------------------------
             if self.use_synthetic:
                 phase = total_frames * 0.04
-                # In synthetic mode, simulate occasional fall or respawn banner on poorer candidates
                 is_falling = (total_frames > 220) and (candidate_idx % 2 == 1 and not is_champion)
                 is_respawn = (total_frames > 180) and (candidate_idx % 3 == 0 and not is_champion)
                 frame_bgr = ScreenCapture.generate_synthetic_polytrack_frame(
-                    800, 600, is_falling=is_falling, has_respawn_banner=is_respawn
+                    800, 600, is_falling=is_falling, has_respawn_banner=is_respawn, biome="summer"
                 )
                 shift = int(np.sin(phase) * 30.0)
                 M = np.float32([[1, 0, shift], [0, 1, 0]])
@@ -178,12 +179,13 @@ class EvolutionaryTrainer:
 
             max_prompt_score = max(max_prompt_score, prompt_score)
 
-            # TERMINATION CHECK: Seeing respawn banner ends attempt IMMEDIATELY!
+            # TERMINATION CHECK 1: Respawn banner ends attempt IMMEDIATELY!
             if is_respawn:
                 is_alive = False
                 death_reason = "respawn_banner"
                 break
 
+            # TERMINATION CHECK 2: Falling off track (variance collapse or floor color)
             if is_falling:
                 consecutive_falls += 1
                 if consecutive_falls >= 4:
@@ -194,17 +196,47 @@ class EvolutionaryTrainer:
                 consecutive_falls = 0
 
             # ---------------------------------------------------------
-            # 2. Retina processing
+            # 2. Retina processing (Optical Flow & Ommatidia)
             # ---------------------------------------------------------
             retina_out = self.retina.process(frame_bgr)
+            vs_forward = float(retina_out.lptc_vs_forward)
 
             # ---------------------------------------------------------
             # 3. Brain SNN inference
             # ---------------------------------------------------------
-            brain_out = self.brain.forward_frame(retina_out.stimulation_currents)
+            brain_out = self.brain.forward_frame(retina_out.stimulation_currents, vs_forward=vs_forward)
+
+            # Track directional movement
+            if self.use_synthetic:
+                # In synthetic mode, pressing W simulates forward velocity
+                if brain_out.actions["w"]:
+                    sim_speed = 0.45
+                    positive_forward_frames += 1
+                    cumulative_forward_speed += sim_speed
+                else:
+                    still_speed = 0.0
+            else:
+                if vs_forward > 0.02:
+                    positive_forward_frames += 1
+                    cumulative_forward_speed += vs_forward
+                elif vs_forward < -0.01:
+                    reverse_frames += 1
+
+            # TERMINATION CHECK 3: Anti-Reverse & Anti-Stagnation
+            # If the car starts going backwards or stands still for too long, abort!
+            if total_frames == 45 and not self.use_synthetic:
+                if positive_forward_frames < 6 or reverse_frames > 15:
+                    is_alive = False
+                    death_reason = "stagnation_or_reverse"
+                    break
+
+            if reverse_frames >= 25 and not self.use_synthetic:
+                is_alive = False
+                death_reason = "reversing"
+                break
 
             # ---------------------------------------------------------
-            # 4. Actuation
+            # 4. Actuation (WASD dispatch)
             # ---------------------------------------------------------
             if not self.use_synthetic:
                 self.harness.inputs.set_actions(
@@ -214,29 +246,40 @@ class EvolutionaryTrainer:
                     d=brain_out.actions["d"],
                 )
 
-            # Accumulate forward thrust and optical flow speed
-            forward_thrust = brain_out.dn_spike_rates.get("DNp01_L", 0.0) + brain_out.dn_spike_rates.get("DNp01_R", 0.0)
-            optic_flow_speed = max(0.0, retina_out.lptc_vs_forward)
-            cumulative_forward_speed += float(forward_thrust + optic_flow_speed)
-
         # Release keys safely after candidate attempt
         if not self.use_synthetic:
             self.harness.inputs.release_all()
             if not is_alive:
                 self.harness.inputs.reset_game()
 
-        survival_fraction = total_frames / float(self.max_frames)
+        # -------------------------------------------------------------
+        # 5. Composite Fitness Scoring: Forward Progress Optimization
+        # -------------------------------------------------------------
+        forward_ratio = positive_forward_frames / max(1, total_frames)
         avg_speed = cumulative_forward_speed / max(1, total_frames)
 
-        # Composite Fitness:
-        # Survival (0..100) + Speed (0..60) - Penalty for crash/banner
-        crash_penalty = 50.0 if not is_alive else 0.0
-        fitness = (survival_fraction * 100.0) + (avg_speed * 50.0) - crash_penalty
+        # Distance & Speed rewards
+        distance_score = float(cumulative_forward_speed * 12.0)
+        speed_score = float(avg_speed * 80.0)
+
+        # Survival points: ONLY rewarded if actively driving forward!
+        # Standing still or reversing gives 0 survival points.
+        survival_fraction = total_frames / float(self.max_frames)
+        survival_score = float(survival_fraction * 80.0 * forward_ratio)
+
+        # Penalties:
+        crash_penalty = 40.0 if not is_alive else 0.0
+        reverse_penalty = 50.0 if (death_reason in ["reversing", "stagnation_or_reverse"] or reverse_frames > 12) else 0.0
+
+        fitness = distance_score + speed_score + survival_score - crash_penalty - reverse_penalty
 
         metrics = {
             "fitness": float(fitness),
             "survival_frames": total_frames,
             "survival_fraction": float(survival_fraction),
+            "positive_forward_frames": positive_forward_frames,
+            "reverse_frames": reverse_frames,
+            "forward_ratio": float(forward_ratio),
             "avg_speed": float(avg_speed),
             "is_alive": bool(is_alive),
             "death_reason": death_reason,

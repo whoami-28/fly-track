@@ -228,13 +228,24 @@ class PlasticMotorDecoder(nn.Module):
             self.readout.weight.data[3, 0] = -1.5  # DNa01_L
 
             # Threshold biases
-            self.readout.bias.data[0] = -0.5  # W bias
+            self.readout.bias.data[0] = +0.5  # W bias: positive baseline throttle drive
             self.readout.bias.data[1] = -0.4  # A bias
-            self.readout.bias.data[2] = -0.8  # S bias
+            self.readout.bias.data[2] = -1.0  # S bias: naturally inhibited brake
             self.readout.bias.data[3] = -0.4  # D bias
 
-    def decode(self, mean_dn_spikes: torch.Tensor) -> Tuple[Dict[str, bool], Dict[str, float]]:
-        """Decode descending neuron firing rates into discrete WASD key actions and probabilities."""
+    def decode(
+        self,
+        mean_dn_spikes: torch.Tensor,
+        vs_forward: float = 0.0,
+    ) -> Tuple[Dict[str, bool], Dict[str, float]]:
+        """Decode descending neuron firing rates into discrete WASD key actions and probabilities.
+
+        Constraint:
+        In Polytrack, 'S' engages reverse gear if the car is stationary or moving backward.
+        Therefore, 'S' is strictly prohibited at standstill / reverse, and can ONLY be engaged:
+        1. As a decelerating brake when forward velocity is positive (vs_forward > 0.05).
+        2. As a drift / power-slide initiator when combined with steering (A/D) at speed.
+        """
         # Logits: (Batch, 4)
         logits = self.readout(mean_dn_spikes)
         probs = torch.sigmoid(logits)[0]  # Take first item in batch
@@ -247,11 +258,36 @@ class PlasticMotorDecoder(nn.Module):
         # Mutually exclusive steering: cannot press A and D at the same time
         steer_a = prob_a > 0.5 and (prob_a > prob_d)
         steer_d = prob_d > 0.5 and (prob_d > prob_a)
+        is_turning = steer_a or steer_d
+
+        # Brake/Drift constraint:
+        # Car must have positive forward momentum (vs_forward > 0.05) to be physically allowed to brake or drift.
+        # From standstill (vs_forward <= 0.05), 'S' is strictly locked out (preventing reverse gear).
+        can_brake = vs_forward > 0.05
+        allow_s = can_brake and (prob_s > 0.5)
+
+        if not can_brake:
+            # At start line or standstill: throttle forward, lock out reverse S
+            action_w = bool(prob_w > 0.35)
+            action_s = False
+        else:
+            if is_turning:
+                # In turns: allow simultaneous W and S for drifting / power sliding!
+                action_w = bool(prob_w > 0.45)
+                action_s = bool(allow_s)
+            else:
+                # On straights: W and S are mutually exclusive
+                if allow_s and (prob_s > prob_w):
+                    action_w = False
+                    action_s = True
+                else:
+                    action_w = bool(prob_w > 0.45)
+                    action_s = False
 
         actions = {
-            "w": bool(prob_w > 0.5),
+            "w": bool(action_w),
             "a": bool(steer_a),
-            "s": bool(prob_s > 0.5),
+            "s": bool(action_s),
             "d": bool(steer_d),
         }
         action_probs = {
@@ -303,17 +339,23 @@ class FlyBrain(nn.Module):
         self,
         retina_currents: np.ndarray,
         k_substeps: Optional[int] = None,
+        vs_forward: Optional[float] = None,
     ) -> BrainInferenceOutput:
         """Process a single camera frame through the SNN over K simulation sub-steps.
 
         Args:
             retina_currents: 1D NumPy array of shape (2004,) from DrosophilaRetina.
             k_substeps: Number of LIF integration steps (defaults to config.SNN_SUBSTEPS_PER_FRAME).
+            vs_forward: Optional forward optic flow velocity. If None, read from retina_currents[-2].
         Returns:
             BrainInferenceOutput dataclass.
         """
         t0 = time.perf_counter_ns()
         k = k_substeps or self.k_substeps
+
+        # Extract forward velocity cue from retina features (VS_Forward is at index -2)
+        if vs_forward is None:
+            vs_forward = float(retina_currents[-2]) if len(retina_currents) >= 4 else 0.0
 
         # Step 1: Adapt input retina features -> 26 LPTC sensory currents
         retina_tensor = torch.from_numpy(retina_currents).float().unsqueeze(0).to(self.device)
@@ -340,8 +382,8 @@ class FlyBrain(nn.Module):
         dn_spikes = all_spikes[:, self.dn_indices]        # Shape: (K, 8)
         mean_dn_rates = torch.mean(dn_spikes, dim=0, keepdim=True)  # Shape: (1, 8)
 
-        # Step 4: Motor decoding -> WASD key actions
-        actions, action_probs = self.motor_decoder.decode(mean_dn_rates)
+        # Step 4: Motor decoding -> WASD key actions (strictly prohibits reverse S from standstill)
+        actions, action_probs = self.motor_decoder.decode(mean_dn_rates, vs_forward=vs_forward)
 
         # Step 5: Decode internal heading compass from E-PG bump attractor
         epg_rates = torch.mean(all_spikes[:, self.epg_indices], dim=0).detach().cpu().numpy()

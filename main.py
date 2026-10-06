@@ -132,7 +132,7 @@ class PolytrackOrchestrator:
             brain_out = self.brain.forward_frame(np.zeros_like(retina_out.stimulation_currents))
             actions = {"w": False, "a": False, "s": False, "d": False}
         else:
-            brain_out = self.brain.forward_frame(retina_out.stimulation_currents)
+            brain_out = self.brain.forward_frame(retina_out.stimulation_currents, vs_forward=retina_out.lptc_vs_forward)
             actions = brain_out.actions if self.autonomous_mode else {"w": False, "a": False, "s": False, "d": False}
 
         # -------------------------------------------------------------

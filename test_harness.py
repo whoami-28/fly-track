@@ -77,6 +77,28 @@ def test_game_state_detector_fall() -> None:
     assert is_falling
     assert var < 1.0
 
+    # 3. Seasonal Biome Floors (Summer Green, Desert Orange-Brown, Winter White)
+    # Summer Green floor fall
+    summer_fall = ScreenCapture.generate_synthetic_polytrack_frame(800, 600, is_falling=True, biome="summer")
+    for _ in range(6):
+        is_fall_summer, _ = detector.detect_fall(summer_fall)
+    assert is_fall_summer, "Summer green floor must trigger fall detection!"
+    assert detector.last_detected_biome == "summer_green"
+
+    # Desert Orange-Brown floor fall
+    desert_fall = ScreenCapture.generate_synthetic_polytrack_frame(800, 600, is_falling=True, biome="desert")
+    for _ in range(6):
+        is_fall_desert, _ = detector.detect_fall(desert_fall)
+    assert is_fall_desert, "Desert orange-brown floor must trigger fall detection!"
+    assert detector.last_detected_biome == "desert_orange_brown"
+
+    # Winter White snow floor fall
+    winter_fall = ScreenCapture.generate_synthetic_polytrack_frame(800, 600, is_falling=True, biome="winter")
+    for _ in range(6):
+        is_fall_winter, _ = detector.detect_fall(winter_fall)
+    assert is_fall_winter, "Winter white snow floor must trigger fall detection!"
+    assert detector.last_detected_biome == "winter_white"
+
 
 def test_game_state_detector_respawn_prompt() -> None:
     detector = GameStateDetector()

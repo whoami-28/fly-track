@@ -51,19 +51,28 @@ def test_motor_decoder_actions() -> None:
     connectome = get_or_build_connectome()
     decoder = PlasticMotorDecoder(connectome)
 
-    # All zeros firing rates
+    # All zeros firing rates at standstill (vs_forward = 0.0)
     zero_rates = torch.zeros(1, 8)
-    actions, probs = decoder.decode(zero_rates)
+    actions, probs = decoder.decode(zero_rates, vs_forward=0.0)
     assert isinstance(actions, dict)
     assert set(actions.keys()) == {"w", "a", "s", "d"}
+    assert actions["s"] is False, "S must NEVER be engaged from a standstill (cannot reverse)!"
     for k in ["w", "a", "s", "d"]:
         assert 0.0 <= probs[k] <= 1.0
 
     # Mutual exclusivity of steering:
     # Even if both left and right DNs fire, one of A or D must take precedence or neither
     high_rates = torch.ones(1, 8) * 0.9
-    actions_high, _ = decoder.decode(high_rates)
+    actions_high, _ = decoder.decode(high_rates, vs_forward=0.0)
     assert not (actions_high["a"] and actions_high["d"]), "Steering A and D cannot both be True simultaneously!"
+    assert actions_high["s"] is False, "S must remain locked out at standstill even with high brake spike rates!"
+
+    # At speed (vs_forward > 0.05), braking/drifting is permitted
+    brake_rates = torch.zeros(1, 8)
+    brake_rates[0, 6] = 0.8  # DNb01_L
+    brake_rates[0, 7] = 0.8  # DNb01_R
+    actions_moving, _ = decoder.decode(brake_rates, vs_forward=0.5)
+    assert actions_moving["s"] is True, "S must be permitted for deceleration when moving forward!"
 
 
 def test_fly_brain_end_to_end() -> None:

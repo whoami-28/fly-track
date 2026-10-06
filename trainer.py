@@ -141,6 +141,7 @@ class EvolutionaryTrainer:
         self.retina.reset()
 
         if not self.use_synthetic:
+            self.harness.ensure_window_focus()
             self.harness.inputs.reset_game()
             time.sleep(0.35)  # Pause for game track reset
 

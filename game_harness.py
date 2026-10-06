@@ -383,8 +383,70 @@ class ScreenCapture:
         self.sct.close()
 
 
+# Hardware scan codes for DirectInput / Windows games (DirectX, Electron, Unity, Godot)
+SCANCODE_MAP: Dict[str, int] = {
+    "w": 0x11,  # DIK_W
+    "a": 0x1E,  # DIK_A
+    "s": 0x1F,  # DIK_S
+    "d": 0x20,  # DIK_D
+    "r": 0x13,  # DIK_R
+    " ": 0x39,  # DIK_SPACE
+}
+
+if sys.platform == "win32":
+    PUL = ctypes.POINTER(ctypes.c_ulong)
+
+    class KeyBdInput(ctypes.Structure):
+        _fields_ = [
+            ("wVk", ctypes.wintypes.WORD),
+            ("wScan", ctypes.wintypes.WORD),
+            ("dwFlags", ctypes.wintypes.DWORD),
+            ("time", ctypes.wintypes.DWORD),
+            ("dwExtraInfo", PUL),
+        ]
+
+    class HardwareInput(ctypes.Structure):
+        _fields_ = [
+            ("uMsg", ctypes.wintypes.DWORD),
+            ("wParamL", ctypes.wintypes.WORD),
+            ("wParamH", ctypes.wintypes.WORD),
+        ]
+
+    class MouseInput(ctypes.Structure):
+        _fields_ = [
+            ("dx", ctypes.wintypes.LONG),
+            ("dy", ctypes.wintypes.LONG),
+            ("mouseData", ctypes.wintypes.DWORD),
+            ("dwFlags", ctypes.wintypes.DWORD),
+            ("time", ctypes.wintypes.DWORD),
+            ("dwExtraInfo", PUL),
+        ]
+
+    class Input_I(ctypes.Union):
+        _fields_ = [("ki", KeyBdInput), ("mi", MouseInput), ("hi", HardwareInput)]
+
+    class WinInput(ctypes.Structure):
+        _fields_ = [("type", ctypes.wintypes.DWORD), ("ii", Input_I)]
+
+    KEYEVENTF_SCANCODE = 0x0008
+    KEYEVENTF_KEYUP = 0x0002
+    INPUT_KEYBOARD = 1
+
+    def send_win_scancode(scancode: int, is_down: bool) -> None:
+        """Send low-level hardware scan code event directly to the Windows event queue."""
+        flags = KEYEVENTF_SCANCODE if is_down else (KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP)
+        extra = ctypes.c_ulong(0)
+        ii = Input_I()
+        ii.ki = KeyBdInput(0, scancode, flags, 0, ctypes.pointer(extra))
+        x = WinInput(INPUT_KEYBOARD, ii)
+        ctypes.windll.user32.SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
+else:
+    def send_win_scancode(scancode: int, is_down: bool) -> None:
+        pass
+
+
 class InputEmulator:
-    """Keyboard input emulator for WASD controls with safety cleanup."""
+    """Keyboard input emulator for WASD controls with hardware scan code and pynput support."""
 
     def __init__(self) -> None:
         self.keyboard = KeyboardController()
@@ -399,6 +461,22 @@ class InputEmulator:
         self._reset_key = KeyCode.from_char(config.KEY_RESET)
         # Register atexit to prevent keys being stuck down if terminated unexpectedly
         atexit.register(self.release_all)
+
+    def _dispatch_key(self, key_char: str, is_down: bool) -> None:
+        """Dispatch key state via hardware scancode (for DirectInput/games) and pynput."""
+        if sys.platform == "win32" and key_char in SCANCODE_MAP:
+            try:
+                send_win_scancode(SCANCODE_MAP[key_char], is_down=is_down)
+            except Exception as e:
+                logger.debug(f"Hardware scancode dispatch error: {e}")
+        try:
+            kc = self._key_codes.get(key_char, KeyCode.from_char(key_char))
+            if is_down:
+                self.keyboard.press(kc)
+            else:
+                self.keyboard.release(kc)
+        except Exception:
+            pass
 
     def set_actions(self, w: bool = False, a: bool = False, s: bool = False, d: bool = False) -> float:
         """Apply desired WASD state.
@@ -417,10 +495,10 @@ class InputEmulator:
         for key_char, should_press in target.items():
             is_pressed = self.active_keys[key_char]
             if should_press and not is_pressed:
-                self.keyboard.press(self._key_codes[key_char])
+                self._dispatch_key(key_char, True)
                 self.active_keys[key_char] = True
             elif not should_press and is_pressed:
-                self.keyboard.release(self._key_codes[key_char])
+                self._dispatch_key(key_char, False)
                 self.active_keys[key_char] = False
 
         dt_ms = (time.perf_counter_ns() - t0) / 1_000_000.0
@@ -429,19 +507,24 @@ class InputEmulator:
     def reset_game(self) -> None:
         """Trigger track restart via the reset key ('r')."""
         self.release_all()
-        self.keyboard.press(self._reset_key)
-        time.sleep(0.05)
-        self.keyboard.release(self._reset_key)
+        self._dispatch_key(config.KEY_RESET, True)
+        time.sleep(0.08)
+        self._dispatch_key(config.KEY_RESET, False)
 
     def release_all(self) -> None:
         """Emergency release for all controlled keys."""
         for key_char, is_pressed in list(self.active_keys.items()):
             if is_pressed:
                 try:
-                    self.keyboard.release(self._key_codes[key_char])
+                    self._dispatch_key(key_char, False)
                 except Exception:
                     pass
                 self.active_keys[key_char] = False
+        if sys.platform == "win32":
+            try:
+                send_win_scancode(SCANCODE_MAP["r"], False)
+            except Exception:
+                pass
 
 
 class GameStateDetector:
@@ -652,6 +735,8 @@ class PolytrackHarness:
 
     def __init__(self, config_path: Path = config.CALIBRATION_FILE, fallback_synthetic: bool = False) -> None:
         self.config_path = config_path
+        self.fallback_synthetic = fallback_synthetic
+        self.saved_metadata: Dict[str, Any] = {}
         self.bbox = self.load_calibration() or config.DEFAULT_BBOX.copy()
         self.capture = ScreenCapture(self.bbox, fallback_synthetic=fallback_synthetic)
         self.inputs = InputEmulator()
@@ -665,12 +750,50 @@ class PolytrackHarness:
                 with open(self.config_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     bbox = data.get("bbox")
+                    self.saved_metadata = data.get("metadata", {})
                     if bbox and all(k in bbox for k in ["top", "left", "width", "height"]):
                         logger.info(f"Loaded calibration from {self.config_path}: {bbox}")
                         return bbox
             except Exception as e:
                 logger.error(f"Failed to read calibration file: {e}")
         return None
+
+    def ensure_window_focus(self) -> bool:
+        """Ensure Polytrack window is restored, in foreground, and game canvas has keyboard focus."""
+        if sys.platform != "win32" or self.fallback_synthetic:
+            return True
+
+        hwnd = None
+        user32 = ctypes.windll.user32
+        if self.saved_metadata:
+            saved_hwnd = self.saved_metadata.get("hwnd")
+            if saved_hwnd and user32.IsWindow(saved_hwnd):
+                hwnd = saved_hwnd
+
+        if not hwnd:
+            windows = find_windows_by_keywords(config.WINDOW_TITLE_KEYWORDS)
+            polytrack_matches = [w for w in windows if "polytrack" in w[1].lower()]
+            target = polytrack_matches[0] if polytrack_matches else (windows[0] if windows else None)
+            if target:
+                hwnd = target[0]
+                self.save_calibration(target[2].to_mss_dict(), metadata={"window_title": target[1], "hwnd": hwnd})
+
+        if hwnd and user32.IsWindow(hwnd):
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.SetForegroundWindow(hwnd)
+            time.sleep(0.08)
+
+            # Click center of game viewport to give keyboard focus to the game canvas
+            if self.bbox:
+                cx = self.bbox["left"] + self.bbox["width"] // 2
+                cy = self.bbox["top"] + self.bbox["height"] // 2
+                user32.SetCursorPos(cx, cy)
+                user32.mouse_event(2, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+                time.sleep(0.02)
+                user32.mouse_event(4, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+                time.sleep(0.05)
+            return True
+        return False
 
     def save_calibration(self, bbox: Dict[str, int], metadata: Optional[Dict[str, Any]] = None) -> None:
         """Save bounding box calibration to json file."""

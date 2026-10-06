@@ -356,6 +356,9 @@ class PolytrackOrchestrator:
         cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(win_name, 1024, 640)
 
+        if not self.use_synthetic:
+            self.harness.ensure_window_focus()
+
         try:
             while True:
                 frame_bgr, retina_out, brain_out, telem = self.step()

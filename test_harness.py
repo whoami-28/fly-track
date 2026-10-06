@@ -78,6 +78,21 @@ def test_game_state_detector_fall() -> None:
     assert var < 1.0
 
 
+def test_game_state_detector_respawn_prompt() -> None:
+    detector = GameStateDetector()
+    # 1. Normal synthetic frame
+    normal = ScreenCapture.generate_synthetic_polytrack_frame(800, 600, is_falling=False, has_respawn_banner=False)
+    is_term, is_fall, is_respawn, _, score = detector.detect_fall_or_crash(normal)
+    assert not is_respawn, "False positive on normal frame"
+
+    # 2. Frame with respawn banner
+    with_banner = ScreenCapture.generate_synthetic_polytrack_frame(800, 600, is_falling=False, has_respawn_banner=True)
+    is_term_r, is_fall_r, is_respawn_r, _, score_r = detector.detect_fall_or_crash(with_banner)
+    assert is_respawn_r, "Failed to detect respawn banner"
+    assert is_term_r, "Terminal state not triggered by banner"
+    assert score_r >= 0.70, f"Score too low: {score_r}"
+
+
 def test_latency_tracker_statistics() -> None:
     tracker = LatencyTracker()
     for _ in range(50):
@@ -99,6 +114,8 @@ def test_harness_step_cycle() -> None:
         assert "latency_total_ms" in telemetry
         assert telemetry["latency_total_ms"] < 40.0
         assert telemetry["actions"]["w"] is True
+        assert "is_terminal" in telemetry
+        assert "is_respawn_prompt" in telemetry
     finally:
         harness.inputs.release_all()
 
@@ -111,6 +128,8 @@ if __name__ == "__main__":
     print("test_input_emulator_state passed.")
     test_game_state_detector_fall()
     print("test_game_state_detector_fall passed.")
+    test_game_state_detector_respawn_prompt()
+    print("test_game_state_detector_respawn_prompt passed.")
     test_latency_tracker_statistics()
     print("test_latency_tracker_statistics passed.")
     test_harness_step_cycle()

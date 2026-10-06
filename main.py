@@ -89,19 +89,36 @@ class PolytrackOrchestrator:
         if self.use_synthetic:
             self.step_counter += 1
             phase = self.step_counter * 0.04
-            is_falling = (self.step_counter // 400) % 2 == 1
-            frame_bgr = ScreenCapture.generate_synthetic_polytrack_frame(800, 600, is_falling=is_falling)
+            is_falling = (self.step_counter // 500) % 2 == 1
+            is_respawn = (self.step_counter > 400 and (self.step_counter // 200) % 3 == 0)
+            frame_bgr = ScreenCapture.generate_synthetic_polytrack_frame(
+                800, 600, is_falling=is_falling, has_respawn_banner=is_respawn
+            )
             # Add synthetic steering displacement
             shift = int(np.sin(phase) * 35.0)
             M = np.float32([[1, 0, shift], [0, 1, 0]])
             frame_bgr = cv2.warpAffine(frame_bgr, M, (800, 600), borderMode=cv2.BORDER_REFLECT)
             cap_ms = 1.0
-            game_telem = {"is_falling": is_falling, "laplacian_var": 120.0, "hud_delta": 0.5}
+            game_telem = {
+                "is_terminal": is_falling or is_respawn,
+                "is_falling": is_falling,
+                "is_respawn_prompt": is_respawn,
+                "prompt_score": 1.0 if is_respawn else 0.1,
+                "laplacian_var": 120.0,
+                "hud_delta": 0.5,
+            }
         else:
             frame_bgr, cap_ms = self.harness.capture.grab_bgr()
-            is_falling, lap_var = self.harness.state_detector.detect_fall(frame_bgr)
+            is_terminal, is_falling, is_respawn, lap_var, prompt_score = self.harness.state_detector.detect_fall_or_crash(frame_bgr)
             hud_delta = self.harness.state_detector.check_hud_activity(frame_bgr)
-            game_telem = {"is_falling": is_falling, "laplacian_var": lap_var, "hud_delta": hud_delta}
+            game_telem = {
+                "is_terminal": is_terminal,
+                "is_falling": is_falling,
+                "is_respawn_prompt": is_respawn,
+                "prompt_score": prompt_score,
+                "laplacian_var": lap_var,
+                "hud_delta": hud_delta,
+            }
 
         # -------------------------------------------------------------
         # Phase 2: Drosophila Retina & Hassenstein-Reichardt Correlator
@@ -132,10 +149,12 @@ class PolytrackOrchestrator:
             input_ms = 0.0
             self.harness.inputs.release_all()
 
-        # Handle fall off track: auto-reset game
-        if game_telem["is_falling"] and not self.use_synthetic:
-            logger.warning("Car fell off track! Triggering automatic reset ('r')...")
-            self.harness.inputs.reset_game()
+        # Handle terminal conditions: respawn prompt or fall off track -> auto-reset game
+        if game_telem["is_terminal"]:
+            reason = "RESPAWN BANNER PROMPT" if game_telem["is_respawn_prompt"] else "FALL OFF TRACK"
+            logger.warning(f"Terminal condition detected ({reason})! Terminating attempt and resetting ('r')...")
+            if not self.use_synthetic:
+                self.harness.inputs.reset_game()
             self.brain.reset()
             self.retina.reset()
             self.episode_start_time = time.time()
@@ -152,7 +171,10 @@ class PolytrackOrchestrator:
             "survival_time_sec": self.survival_time_sec,
             "is_paused": self.is_paused,
             "autonomous_mode": self.autonomous_mode,
+            "is_terminal": game_telem["is_terminal"],
             "is_falling": game_telem["is_falling"],
+            "is_respawn_prompt": game_telem["is_respawn_prompt"],
+            "prompt_score": game_telem["prompt_score"],
         }
 
         return frame_bgr, retina_out, brain_out, telemetry
@@ -183,7 +205,10 @@ class PolytrackOrchestrator:
         if telem["is_paused"]:
             status_text = "PAUSED (SPACE to resume)"
             status_color = (0, 140, 255)
-        if telem["is_falling"]:
+        elif telem.get("is_respawn_prompt"):
+            status_text = f"RESPAWN BANNER DETECTED (Score: {telem.get('prompt_score', 0):.2f})"
+            status_color = (0, 0, 255)
+        elif telem.get("is_falling"):
             status_text = "FALL OFF TRACK DETECTED"
             status_color = (0, 0, 255)
 

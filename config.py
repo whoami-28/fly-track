@@ -70,4 +70,17 @@ MOTOR_STEER_DIFF_THRESHOLD = float(os.getenv("MOTOR_STEER_THRESHOLD", "0.12"))
 MOTOR_THROTTLE_RATE_THRESHOLD = float(os.getenv("MOTOR_THROTTLE_THRESHOLD", "0.15"))
 MOTOR_BRAKE_RATE_THRESHOLD = float(os.getenv("MOTOR_BRAKE_THRESHOLD", "0.22"))
 
+# Respawn Banner / Death Screen Detection (Module 1 & 5)
+TEMPLATES_DIR = DATA_DIR / "templates"
+RESPAWN_PROMPT_TEMPLATE = TEMPLATES_DIR / "respawn_prompt.png"
+BUTTON_R_TEMPLATE = TEMPLATES_DIR / "button_r.png"
+BUTTON_ENTER_TEMPLATE = TEMPLATES_DIR / "button_enter.png"
+RESPAWN_DETECTION_THRESHOLD = float(os.getenv("RESPAWN_DETECTION_THRESHOLD", "0.68"))
+
+# Evolutionary Training Parameters (Module 5)
+BEST_BRAIN_WEIGHTS_FILE = DATA_DIR / "brain_weights_best.pt"
+EVOLUTION_MUTATION_SIGMA = float(os.getenv("EVOLUTION_MUTATION_SIGMA", "0.04"))
+EVOLUTION_POPULATION_SIZE = int(os.getenv("EVOLUTION_POPULATION_SIZE", "8"))
+
+
 

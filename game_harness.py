@@ -185,7 +185,12 @@ class ScreenCapture:
         self.bbox = bbox.copy()
 
     @staticmethod
-    def generate_synthetic_polytrack_frame(width: int, height: int, is_falling: bool = False) -> np.ndarray:
+    def generate_synthetic_polytrack_frame(
+        width: int,
+        height: int,
+        is_falling: bool = False,
+        has_respawn_banner: bool = False,
+    ) -> np.ndarray:
         """Generate a realistic synthetic Polytrack frame for testing and calibration validation."""
         # Sky background (light cyan/sky tone)
         frame = np.full((height, width, 3), (235, 206, 135), dtype=np.uint8)
@@ -236,6 +241,26 @@ class ScreenCapture:
                 (255, 255, 255),
                 2,
             )
+
+        if has_respawn_banner:
+            # Overlay realistic Polytrack respawn banner at bottom-center
+            prompt_path = config.RESPAWN_PROMPT_TEMPLATE
+            if prompt_path.exists():
+                tmpl = cv2.imread(str(prompt_path))
+                if tmpl is not None:
+                    # Scale to ~65% of screen width
+                    target_w = int(width * 0.65)
+                    scale = target_w / float(tmpl.shape[1])
+                    target_h = int(tmpl.shape[0] * scale)
+                    resized_tmpl = cv2.resize(tmpl, (target_w, target_h), interpolation=cv2.INTER_AREA)
+                    px = (width - target_w) // 2
+                    py = max(0, height - target_h - 20)
+                    frame[py : py + target_h, px : px + target_w] = resized_tmpl
+            else:
+                # Fallback banner rectangle
+                bx, by, bw, bh = int(width * 0.2), int(height * 0.65), int(width * 0.6), int(height * 0.25)
+                cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), (40, 45, 55), -1)
+                cv2.putText(frame, "Press R / Enter to respawn", (bx + 20, by + bh // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
         return frame
 
@@ -333,12 +358,100 @@ class InputEmulator:
 
 
 class GameStateDetector:
-    """Detects game state: fall off track, void detection, and timer/progress tracking."""
+    """Detects game state: fall off track, void detection, respawn banner prompt, and timer/progress tracking."""
 
-    def __init__(self, variance_threshold: float = config.FALL_CONTRAST_VAR_THRESHOLD) -> None:
+    def __init__(
+        self,
+        variance_threshold: float = config.FALL_CONTRAST_VAR_THRESHOLD,
+        prompt_threshold: float = config.RESPAWN_DETECTION_THRESHOLD,
+        template_dir: Optional[Path] = None,
+    ) -> None:
         self.variance_threshold = variance_threshold
+        self.prompt_threshold = prompt_threshold
         self.fall_streak: int = 0
         self.last_hud_snapshot: Optional[np.ndarray] = None
+        self.template_dir = template_dir or config.TEMPLATES_DIR
+
+        # Pre-load grayscale templates for rapid template matching
+        self.templates: List[np.ndarray] = []
+        self._load_templates()
+
+    def _load_templates(self) -> None:
+        """Pre-load templates for fast respawn banner detection."""
+        candidates = [
+            self.template_dir / "button_r.png",
+            self.template_dir / "button_enter.png",
+            self.template_dir / "respawn_prompt.png",
+            config.DATA_DIR / "template_r_badge.png",
+        ]
+        for p in candidates:
+            if p.exists():
+                img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+                if img is not None:
+                    self.templates.append(img)
+        if not self.templates:
+            logger.warning(f"No respawn prompt templates found in {self.template_dir}")
+        else:
+            logger.debug(f"Loaded {len(self.templates)} respawn templates for crash detection.")
+
+    def detect_respawn_prompt(
+        self,
+        frame_bgr: np.ndarray,
+        scales: Tuple[float, ...] = (0.75, 0.9, 1.0, 1.15, 1.3),
+    ) -> Tuple[bool, float]:
+        """Detect whether the respawn banner ('Нажмите R / Enter...') is visible on screen.
+
+        Uses fast multi-scale template matching focused on the lower 60% of the screen.
+        Returns: (is_respawn_prompt, max_match_score)
+        """
+        if not self.templates:
+            return False, 0.0
+
+        h, w = frame_bgr.shape[:2]
+        # In Polytrack, the respawn banner appears in the bottom region (y >= 0.38)
+        roi = frame_bgr[int(h * 0.38) :, :]
+        roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+        # Downsample ROI 2x for sub-5ms matching speed
+        target_w = max(64, roi_gray.shape[1] // 2)
+        target_h = max(64, roi_gray.shape[0] // 2)
+        small_roi = cv2.resize(roi_gray, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+        best_score = 0.0
+        primary_tmpl = self.templates[0]  # button_r
+        base_w = max(4, primary_tmpl.shape[1] // 2)
+        base_h = max(4, primary_tmpl.shape[0] // 2)
+
+        for s in scales:
+            tw = int(base_w * s)
+            th = int(base_h * s)
+            if tw >= small_roi.shape[1] or th >= small_roi.shape[0] or tw < 8 or th < 8:
+                continue
+            tmpl = cv2.resize(primary_tmpl, (tw, th), interpolation=cv2.INTER_AREA)
+            res = cv2.matchTemplate(small_roi, tmpl, cv2.TM_CCOEFF_NORMED)
+            _, score, _, _ = cv2.minMaxLoc(res)
+            if score > best_score:
+                best_score = float(score)
+                # Short-circuit on confident match
+                if best_score >= 0.85:
+                    break
+
+        is_detected = best_score >= self.prompt_threshold
+        return is_detected, best_score
+
+    def detect_fall_or_crash(
+        self,
+        frame_bgr: np.ndarray,
+    ) -> Tuple[bool, bool, bool, float, float]:
+        """Detect both falling off track and in-game respawn banner.
+
+        Returns:
+            (is_terminal, is_falling, is_respawn_prompt, laplacian_variance, prompt_score)
+        """
+        is_falling, lap_var = self.detect_fall(frame_bgr)
+        is_respawn, prompt_score = self.detect_respawn_prompt(frame_bgr)
+        is_terminal = is_falling or is_respawn
+        return is_terminal, is_falling, is_respawn, lap_var, prompt_score
 
     def detect_fall(self, frame_bgr: np.ndarray) -> Tuple[bool, float]:
         """Detect if the car has fallen off the track.
@@ -476,18 +589,18 @@ class PolytrackHarness:
         """Run a single synchronized control step:
 
         1. Capture frame
-        2. Detect game state (fall off track, HUD delta)
+        2. Detect game state (fall off track, respawn prompt, HUD delta)
         3. Dispatch keyboard actions
         4. Record component and total latencies
 
-        Returns: (frame_rgb, is_falling, telemetry_dict)
+        Returns: (frame_rgb, is_terminal, telemetry_dict)
         """
         # Step 1: Screen grab
         frame_bgr, cap_ms = self.capture.grab_bgr()
 
         # Step 2: Game state analysis
         t_proc_0 = time.perf_counter_ns()
-        is_falling, lap_var = self.state_detector.detect_fall(frame_bgr)
+        is_terminal, is_falling, is_respawn, lap_var, prompt_score = self.state_detector.detect_fall_or_crash(frame_bgr)
         hud_delta = self.state_detector.check_hud_activity(frame_bgr)
         proc_ms = (time.perf_counter_ns() - t_proc_0) / 1_000_000.0
 
@@ -503,12 +616,15 @@ class PolytrackHarness:
             "latency_capture_ms": cap_ms,
             "latency_proc_ms": proc_ms,
             "latency_input_ms": input_ms,
+            "is_terminal": is_terminal,
             "is_falling": is_falling,
+            "is_respawn_prompt": is_respawn,
+            "prompt_score": prompt_score,
             "laplacian_var": lap_var,
             "hud_delta": hud_delta,
             "actions": {"w": w, "a": a, "s": s, "d": d},
         }
-        return frame_rgb, is_falling, telemetry
+        return frame_rgb, is_terminal, telemetry
 
     def run_benchmark(self, num_cycles: int = 150) -> Dict[str, Any]:
         """Run latency and throughput benchmark over N cycles and display statistics."""
@@ -616,7 +732,7 @@ class PolytrackHarness:
             while True:
                 t0 = time.perf_counter()
                 frame_bgr, cap_ms = self.capture.grab_bgr()
-                is_falling, lap_var = self.state_detector.detect_fall(frame_bgr)
+                is_terminal, is_falling, is_respawn, lap_var, prompt_score = self.state_detector.detect_fall_or_crash(frame_bgr)
                 hud_delta = self.state_detector.check_hud_activity(frame_bgr)
                 dt_total = (time.perf_counter() - t0) * 1000.0
 
@@ -632,12 +748,19 @@ class PolytrackHarness:
                 )
 
                 # Status banner
-                state_text = "FALLING OFF TRACK!" if is_falling else "ALIVE ON TRACK"
-                color = (0, 0, 255) if is_falling else (0, 255, 0)
-                cv2.putText(frame_bgr, state_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+                if is_respawn:
+                    state_text = f"RESPAWN BANNER DETECTED! (Score: {prompt_score:.2f})"
+                    color = (0, 0, 255)
+                elif is_falling:
+                    state_text = f"FALLING OFF TRACK! (LapVar: {lap_var:.1f})"
+                    color = (0, 0, 255)
+                else:
+                    state_text = "ALIVE ON TRACK"
+                    color = (0, 255, 0)
+                cv2.putText(frame_bgr, state_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-                stats_text = f"Latency: {dt_total:.1f}ms | LapVar: {lap_var:.1f} | HUD Delta: {hud_delta:.1f}"
-                cv2.putText(frame_bgr, stats_text, (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                stats_text = f"Latency: {dt_total:.1f}ms | LapVar: {lap_var:.1f} | Respawn: {prompt_score:.2f} | HUD Delta: {hud_delta:.1f}"
+                cv2.putText(frame_bgr, stats_text, (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
                 cv2.imshow(win_name, frame_bgr)
                 key = cv2.waitKey(1) & 0xFF

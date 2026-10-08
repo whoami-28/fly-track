@@ -237,8 +237,16 @@ class PlasticMotorDecoder(nn.Module):
         self,
         mean_dn_spikes: torch.Tensor,
         vs_forward: float = 0.0,
+        boundary: Optional[Any] = None,
     ) -> Tuple[Dict[str, bool], Dict[str, float]]:
         """Decode descending neuron firing rates into discrete WASD key actions and probabilities.
+
+        Biological Centering Reflex:
+        Incorporate Optomotor Centering Response when track curbs are perceived:
+        - Car drifted right (offset > 0) -> stimulates Left turn 'A'
+        - Car drifted left (offset < 0) -> stimulates Right turn 'D'
+        - Road curves right/left ahead -> anticipatory steering into the apex
+        - Proximity risk to curb > 0.75 -> emergency wall avoidance
 
         Constraint:
         In Polytrack, 'S' engages reverse gear if the car is stationary or moving backward.
@@ -254,6 +262,31 @@ class PlasticMotorDecoder(nn.Module):
         prob_a = float(probs[1].item())
         prob_s = float(probs[2].item())
         prob_d = float(probs[3].item())
+
+        # Biological Optomotor Centering Reflex (Curridor Centering)
+        if boundary is not None and getattr(boundary, "corridor_detected", False):
+            # Centering demand: positive = steer right, negative = steer left
+            # -1.2 * offset: offset > 0 (car is right of center) -> demand negative (steer left)
+            # +0.8 * heading: heading > 0 (road curves right) -> demand positive (steer right)
+            heading_norm = float(np.clip(boundary.track_heading_deg / 45.0, -1.5, 1.5))
+            steer_demand = float(-1.2 * boundary.lateral_offset + 0.8 * heading_norm)
+
+            if steer_demand > 0.05:
+                # Steer rightward
+                prob_d = min(1.0, prob_d + steer_demand * 0.35)
+                prob_a = max(0.0, prob_a - steer_demand * 0.20)
+            elif steer_demand < -0.05:
+                # Steer leftward
+                prob_a = min(1.0, prob_a + (-steer_demand) * 0.35)
+                prob_d = max(0.0, prob_d - (-steer_demand) * 0.20)
+
+            # Emergency wall / curb avoidance
+            if getattr(boundary, "proximity_left", 0.0) > 0.75:
+                prob_d = max(prob_d, 0.75)
+                prob_a = min(prob_a, 0.25)
+            elif getattr(boundary, "proximity_right", 0.0) > 0.75:
+                prob_a = max(prob_a, 0.75)
+                prob_d = min(prob_d, 0.25)
 
         # Mutually exclusive steering: cannot press A and D at the same time
         steer_a = prob_a > 0.5 and (prob_a > prob_d)
@@ -337,6 +370,7 @@ class FlyBrain(nn.Module):
         retina_currents: np.ndarray,
         k_substeps: Optional[int] = None,
         vs_forward: Optional[float] = None,
+        boundary: Optional[Any] = None,
     ) -> BrainInferenceOutput:
         """Process a single camera frame through the SNN over K simulation sub-steps.
 
@@ -344,6 +378,7 @@ class FlyBrain(nn.Module):
             retina_currents: 1D NumPy array of shape (2004,) from DrosophilaRetina.
             k_substeps: Number of LIF integration steps (defaults to config.SNN_SUBSTEPS_PER_FRAME).
             vs_forward: Optional forward optic flow velocity. If None, read from retina_currents[-2].
+            boundary: Optional BoundaryPerceptionOutput from TrackBoundaryDetector for centering reflex.
         Returns:
             BrainInferenceOutput dataclass.
         """
@@ -379,8 +414,8 @@ class FlyBrain(nn.Module):
         dn_spikes = all_spikes[:, self.dn_indices]        # Shape: (K, 8)
         mean_dn_rates = torch.mean(dn_spikes, dim=0, keepdim=True)  # Shape: (1, 8)
 
-        # Step 4: Motor decoding -> WASD key actions (strictly prohibits reverse S from standstill)
-        actions, action_probs = self.motor_decoder.decode(mean_dn_rates, vs_forward=vs_forward)
+        # Step 4: Motor decoding -> WASD key actions (incorporates optomotor boundary reflex)
+        actions, action_probs = self.motor_decoder.decode(mean_dn_rates, vs_forward=vs_forward, boundary=boundary)
 
         # Step 5: Decode internal heading compass from E-PG bump attractor
         epg_rates = torch.mean(all_spikes[:, self.epg_indices], dim=0).detach().cpu().numpy()

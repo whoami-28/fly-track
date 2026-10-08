@@ -30,6 +30,7 @@ import numpy as np
 import torch
 
 import config
+from boundary_detector import BoundaryPerceptionOutput, TrackBoundaryDetector
 from fly_brain import BrainInferenceOutput, FlyBrain
 from game_harness import PolytrackHarness, ScreenCapture
 from retina import DrosophilaRetina, RetinaOutput
@@ -60,6 +61,9 @@ class PolytrackOrchestrator:
 
         logger.info("Initializing Drosophila Retina & Motion Preprocessor...")
         self.retina = DrosophilaRetina()
+
+        logger.info("Initializing Track Boundary & Curb Detector...")
+        self.boundary_detector = TrackBoundaryDetector()
 
         logger.info("Initializing Spiking Neural Network (FlyBrain)...")
         self.brain = FlyBrain(k_substeps=config.SNN_SUBSTEPS_PER_FRAME, device=device)
@@ -121,8 +125,9 @@ class PolytrackOrchestrator:
             }
 
         # -------------------------------------------------------------
-        # Phase 2: Drosophila Retina & Hassenstein-Reichardt Correlator
+        # Phase 2: Track Boundaries & Drosophila Retina
         # -------------------------------------------------------------
+        boundary_out = self.boundary_detector.detect(frame_bgr)
         retina_out = self.retina.process(frame_bgr)
 
         # -------------------------------------------------------------
@@ -132,7 +137,11 @@ class PolytrackOrchestrator:
             brain_out = self.brain.forward_frame(np.zeros_like(retina_out.stimulation_currents))
             actions = {"w": False, "a": False, "s": False, "d": False}
         else:
-            brain_out = self.brain.forward_frame(retina_out.stimulation_currents, vs_forward=retina_out.lptc_vs_forward)
+            brain_out = self.brain.forward_frame(
+                retina_out.stimulation_currents,
+                vs_forward=retina_out.lptc_vs_forward,
+                boundary=boundary_out,
+            )
             actions = brain_out.actions if self.autonomous_mode else {"w": False, "a": False, "s": False, "d": False}
 
         # -------------------------------------------------------------
@@ -175,6 +184,7 @@ class PolytrackOrchestrator:
             "is_falling": game_telem["is_falling"],
             "is_respawn_prompt": game_telem["is_respawn_prompt"],
             "prompt_score": game_telem["prompt_score"],
+            "boundary": boundary_out,
         }
 
         return frame_bgr, retina_out, brain_out, telemetry
@@ -194,6 +204,45 @@ class PolytrackOrchestrator:
         # 1. Main Driving View (Left: 600 x 450)
         view_w, view_h = 600, 450
         resized_view = cv2.resize(frame_bgr, (view_w, view_h))
+
+        # Overlay detected track curbs and centerline
+        boundary: Optional[BoundaryPerceptionOutput] = telem.get("boundary")
+        if boundary is not None and boundary.corridor_detected:
+            scale_x = view_w / float(frame_bgr.shape[1])
+            scale_y = view_h / float(frame_bgr.shape[0])
+
+            # Left curb points: Cyan
+            for pt in boundary.left_curb_pts:
+                cv2.circle(resized_view, (int(pt[0] * scale_x), int(pt[1] * scale_y)), 3, (255, 255, 0), -1)
+            # Right curb points: Magenta
+            for pt in boundary.right_curb_pts:
+                cv2.circle(resized_view, (int(pt[0] * scale_x), int(pt[1] * scale_y)), 3, (255, 0, 255), -1)
+            # Centerline points: Bright Green
+            for pt in boundary.center_pts:
+                cv2.circle(resized_view, (int(pt[0] * scale_x), int(pt[1] * scale_y)), 2, (0, 255, 0), -1)
+
+            # Lookahead turn vector
+            if len(boundary.center_pts) >= 4:
+                nc = (int(boundary.center_pts[-1][0] * scale_x), int(boundary.center_pts[-1][1] * scale_y))
+                fc = (int(boundary.center_pts[0][0] * scale_x), int(boundary.center_pts[0][1] * scale_y))
+                cv2.arrowedLine(resized_view, nc, fc, (0, 255, 255), 2)
+
+            # Corridor Centering HUD Bar at bottom of driving view
+            bar_y = view_h - 22
+            bar_w = 260
+            bar_x = (view_w - bar_w) // 2
+            cv2.rectangle(resized_view, (bar_x, bar_y - 12), (bar_x + bar_w, bar_y + 12), (30, 35, 45), -1)
+            cv2.rectangle(resized_view, (bar_x, bar_y - 12), (bar_x + bar_w, bar_y + 12), (70, 80, 100), 1)
+            cv2.line(resized_view, (bar_x + bar_w // 2, bar_y - 10), (bar_x + bar_w // 2, bar_y + 10), (0, 220, 100), 1)
+
+            # Cursor position: offset in [-1.0, 1.0]
+            cursor_x = int(bar_x + bar_w // 2 + np.clip(boundary.lateral_offset, -1.0, 1.0) * (bar_w // 2 - 10))
+            cursor_color = (0, 255, 0) if abs(boundary.lateral_offset) < 0.25 else ((0, 165, 255) if abs(boundary.lateral_offset) < 0.70 else (0, 0, 255))
+            cv2.circle(resized_view, (cursor_x, bar_y), 6, cursor_color, -1)
+            cv2.putText(resized_view, "L", (bar_x + 6, bar_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (160, 180, 200), 1)
+            cv2.putText(resized_view, "R", (bar_x + bar_w - 14, bar_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (160, 180, 200), 1)
+            curb_txt = f"Curb Drift: {boundary.lateral_offset:+.2f} | Turn: {boundary.track_heading_deg:+.1f} deg"
+            cv2.putText(resized_view, curb_txt, (15, view_h - 38), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 255), 1)
 
         # Draw FOE horizon & Center heading line
         cv2.line(resized_view, (view_w // 2, 0), (view_w // 2, view_h), (0, 165, 255), 1)

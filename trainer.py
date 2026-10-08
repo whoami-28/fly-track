@@ -24,6 +24,7 @@ import numpy as np
 import torch
 
 import config
+from boundary_detector import BoundaryPerceptionOutput, TrackBoundaryDetector
 from fly_brain import FlyBrain
 from game_harness import PolytrackHarness, ScreenCapture
 from retina import DrosophilaRetina
@@ -65,9 +66,10 @@ class EvolutionaryTrainer:
         self.output_path = output_weights_path
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Baseline neural and environment components
+        # Baseline neural, visual, and environment components
         self.brain = FlyBrain()
         self.retina = DrosophilaRetina()
+        self.boundary_detector = TrackBoundaryDetector()
         self.harness = PolytrackHarness(fallback_synthetic=use_synthetic)
 
         # Baseline parameter extraction
@@ -150,6 +152,9 @@ class EvolutionaryTrainer:
         positive_forward_frames = 0
         reverse_frames = 0
         consecutive_falls = 0
+        centered_frames = 0
+        curb_riding_frames = 0
+        corridor_detected_frames = 0
         is_alive = True
         death_reason = "survived"
         max_prompt_score = 0.0
@@ -197,15 +202,30 @@ class EvolutionaryTrainer:
                 consecutive_falls = 0
 
             # ---------------------------------------------------------
-            # 2. Retina processing (Optical Flow & Ommatidia)
+            # 2. Track Boundary / Curbstone Perception (Centering Reflex)
+            # ---------------------------------------------------------
+            boundary_out = self.boundary_detector.detect(frame_bgr)
+            if boundary_out.corridor_detected:
+                corridor_detected_frames += 1
+                if abs(boundary_out.lateral_offset) <= 0.25:
+                    centered_frames += 1
+                elif abs(boundary_out.lateral_offset) >= 0.80:
+                    curb_riding_frames += 1
+
+            # ---------------------------------------------------------
+            # 3. Retina processing (Optical Flow & Ommatidia)
             # ---------------------------------------------------------
             retina_out = self.retina.process(frame_bgr)
             vs_forward = float(retina_out.lptc_vs_forward)
 
             # ---------------------------------------------------------
-            # 3. Brain SNN inference
+            # 4. Brain SNN inference (with Optomotor Centering Reflex)
             # ---------------------------------------------------------
-            brain_out = self.brain.forward_frame(retina_out.stimulation_currents, vs_forward=vs_forward)
+            brain_out = self.brain.forward_frame(
+                retina_out.stimulation_currents,
+                vs_forward=vs_forward,
+                boundary=boundary_out,
+            )
 
             # Check HUD timer activity (proves race is actively ticking in live game)
             hud_delta = 0.0
@@ -236,7 +256,7 @@ class EvolutionaryTrainer:
                     break
 
             # ---------------------------------------------------------
-            # 4. Actuation (WASD dispatch)
+            # 5. Actuation (WASD dispatch)
             # ---------------------------------------------------------
             if not self.use_synthetic:
                 self.harness.inputs.set_actions(
@@ -253,25 +273,41 @@ class EvolutionaryTrainer:
                 self.harness.inputs.reset_game()
 
         # -------------------------------------------------------------
-        # 5. Composite Fitness Scoring: Pure Forward Racing Rewards
+        # 6. Composite Fitness Scoring: Forward Racing & Corridor Centering
         # -------------------------------------------------------------
         # Every frame the car races and stays on track without crashing earns points!
         track_time_score = float(total_frames)
         forward_motion_bonus = float(positive_forward_frames * 0.5)
         flow_speed_score = float(cumulative_forward_speed * 10.0)
 
+        # Centering bonus: reward staying inside the smooth asphalt corridor
+        centering_bonus = float(centered_frames * 0.4)
+        # Curb touch penalty: penalize grinding against rumble strips / walls
+        curb_penalty = float(curb_riding_frames * 0.5)
+
         crash_penalty = 35.0 if not is_alive and death_reason != "survived" else 0.0
 
         if death_reason == "did_not_start":
             fitness = 0.0
         else:
-            fitness = max(1.0, track_time_score + forward_motion_bonus + flow_speed_score - crash_penalty)
+            raw_fitness = (
+                track_time_score
+                + forward_motion_bonus
+                + flow_speed_score
+                + centering_bonus
+                - curb_penalty
+                - crash_penalty
+            )
+            fitness = max(1.0, raw_fitness)
 
         metrics = {
             "fitness": float(fitness),
             "survival_frames": total_frames,
             "survival_fraction": float(total_frames / float(self.max_frames)),
             "positive_forward_frames": positive_forward_frames,
+            "centered_frames": centered_frames,
+            "curb_riding_frames": curb_riding_frames,
+            "corridor_detected_frames": corridor_detected_frames,
             "avg_speed": float(cumulative_forward_speed / max(1, total_frames)),
             "is_alive": bool(is_alive),
             "death_reason": death_reason,

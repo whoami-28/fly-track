@@ -289,6 +289,7 @@ class RetinaVisualizer:
         frame_bgr: np.ndarray,
         out: RetinaOutput,
         telemetry: Optional[Dict] = None,
+        boundary: Optional[Any] = None,
     ) -> np.ndarray:
         """Render a 1280x720 composite dashboard showing biological vision stages."""
         # Update histories
@@ -325,6 +326,26 @@ class RetinaVisualizer:
         # Draw Left/Right Eye split line and FOE indicator
         cv2.line(orig_resized, (p1_w // 2, 0), (p1_w // 2, p1_h), (0, 200, 255), 1)
         cv2.circle(orig_resized, (p1_w // 2, int(p1_h * 0.45)), 5, (0, 0, 255), -1)
+
+        # Overlay detected curbs, corridor centerline, and lookahead heading
+        if boundary is not None and getattr(boundary, "corridor_detected", False):
+            scale_x = p1_w / float(frame_bgr.shape[1])
+            scale_y = p1_h / float(frame_bgr.shape[0])
+            for pt in boundary.left_curb_pts:
+                cv2.circle(orig_resized, (int(pt[0] * scale_x), int(pt[1] * scale_y)), 2, (255, 255, 0), -1)  # Cyan
+            for pt in boundary.right_curb_pts:
+                cv2.circle(orig_resized, (int(pt[0] * scale_x), int(pt[1] * scale_y)), 2, (255, 0, 255), -1)  # Magenta
+            for pt in boundary.center_pts:
+                cv2.circle(orig_resized, (int(pt[0] * scale_x), int(pt[1] * scale_y)), 2, (0, 255, 0), -1)    # Green
+
+            if len(boundary.center_pts) >= 4:
+                nc = (int(boundary.center_pts[-1][0] * scale_x), int(boundary.center_pts[-1][1] * scale_y))
+                fc = (int(boundary.center_pts[0][0] * scale_x), int(boundary.center_pts[0][1] * scale_y))
+                cv2.arrowedLine(orig_resized, nc, fc, (0, 255, 255), 2)
+
+            curb_str = f"Curbs: Off={boundary.lateral_offset:+.2f} Turn={boundary.track_heading_deg:+.1f}d"
+            cv2.putText(orig_resized, curb_str, (10, p1_h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1)
+
         canvas[p1_y : p1_y + p1_h, p1_x : p1_x + p1_w] = orig_resized
         self._draw_panel_border(canvas, p1_x, p1_y, p1_w, p1_h, "1. Raw Screen View (Split Hemifields)")
 

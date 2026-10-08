@@ -110,6 +110,50 @@ def test_plastic_parameters_roundtrip() -> None:
     assert np.allclose(params_new, perturbed)
 
 
+def test_motor_decoder_boundary_centering() -> None:
+    from boundary_detector import BoundaryPerceptionOutput
+    connectome = get_or_build_connectome()
+    decoder = PlasticMotorDecoder(connectome)
+    zero_rates = torch.zeros(1, 8)
+
+    # 1. Car drifted to the right of track center (+offset): must steer Left (A)
+    bound_drift_right = BoundaryPerceptionOutput(
+        lateral_offset=0.6,
+        track_heading_deg=0.0,
+        proximity_left=0.0,
+        proximity_right=0.4,
+        corridor_detected=True,
+    )
+    act_l, prob_l = decoder.decode(zero_rates, vs_forward=0.1, boundary=bound_drift_right)
+    assert act_l["a"] is True, "Car drifted right must steer Left (A) to center!"
+    assert act_l["d"] is False
+    assert prob_l["a"] > prob_l["d"]
+
+    # 2. Car drifted to the left of track center (-offset): must steer Right (D)
+    bound_drift_left = BoundaryPerceptionOutput(
+        lateral_offset=-0.6,
+        track_heading_deg=0.0,
+        proximity_left=0.4,
+        proximity_right=0.0,
+        corridor_detected=True,
+    )
+    act_r, prob_r = decoder.decode(zero_rates, vs_forward=0.1, boundary=bound_drift_left)
+    assert act_r["d"] is True, "Car drifted left must steer Right (D) to center!"
+    assert act_r["a"] is False
+    assert prob_r["d"] > prob_r["a"]
+
+    # 3. Emergency wall repulsion on left curb (proximity_left = 0.9): must forcefully steer Right
+    bound_danger_left = BoundaryPerceptionOutput(
+        lateral_offset=0.0,
+        track_heading_deg=0.0,
+        proximity_left=0.9,
+        proximity_right=0.0,
+        corridor_detected=True,
+    )
+    act_danger, prob_danger = decoder.decode(zero_rates, vs_forward=0.1, boundary=bound_danger_left)
+    assert act_danger["d"] is True, "Emergency left wall danger must trigger Right steering (D)!"
+
+
 if __name__ == "__main__":
     print("Running FlyBrain unit tests...")
     test_plastic_input_adapter()

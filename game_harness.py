@@ -550,10 +550,17 @@ class GameStateDetector:
 
     def _load_templates(self) -> None:
         """Pre-load templates for fast respawn banner detection."""
+        self.banner_template: Optional[np.ndarray] = None
+        banner_path = self.template_dir / "respawn_prompt.png"
+        if banner_path.exists():
+            img = cv2.imread(str(banner_path), cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                self.banner_template = img
+                logger.debug(f"Loaded full respawn banner template: shape {img.shape}")
+
         candidates = [
             self.template_dir / "button_r.png",
             self.template_dir / "button_enter.png",
-            self.template_dir / "respawn_prompt.png",
             config.DATA_DIR / "template_r_badge.png",
         ]
         for p in candidates:
@@ -561,7 +568,7 @@ class GameStateDetector:
                 img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
                 if img is not None:
                     self.templates.append(img)
-        if not self.templates:
+        if not self.templates and self.banner_template is None:
             logger.warning(f"No respawn prompt templates found in {self.template_dir}")
         else:
             logger.debug(f"Loaded {len(self.templates)} respawn templates for crash detection.")
@@ -569,46 +576,63 @@ class GameStateDetector:
     def detect_respawn_prompt(
         self,
         frame_bgr: np.ndarray,
-        scales: Tuple[float, ...] = (0.75, 0.9, 1.0, 1.15, 1.3),
+        scales: Tuple[float, ...] = (0.8, 1.0, 1.2),
     ) -> Tuple[bool, float]:
         """Detect whether the respawn banner ('Нажмите R / Enter...') is visible on screen.
 
-        Uses fast multi-scale template matching focused on the lower 60% of the screen.
+        Uses fast template matching focused on the lower 60% of the screen.
         Returns: (is_respawn_prompt, max_match_score)
         """
-        if not self.templates:
-            return False, 0.0
-
         h, w = frame_bgr.shape[:2]
-        # In Polytrack, the respawn banner appears in the bottom region (y >= 0.38)
         roi = frame_bgr[int(h * 0.38) :, :]
         roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-        # Downsample ROI 2x for sub-5ms matching speed
         target_w = max(64, roi_gray.shape[1] // 2)
         target_h = max(64, roi_gray.shape[0] // 2)
         small_roi = cv2.resize(roi_gray, (target_w, target_h), interpolation=cv2.INTER_AREA)
 
         best_score = 0.0
-        primary_tmpl = self.templates[0]  # button_r
-        base_w = max(4, primary_tmpl.shape[1] // 2)
-        base_h = max(4, primary_tmpl.shape[0] // 2)
 
-        for s in scales:
-            tw = int(base_w * s)
-            th = int(base_h * s)
-            if tw >= small_roi.shape[1] or th >= small_roi.shape[0] or tw < 8 or th < 8:
-                continue
-            tmpl = cv2.resize(primary_tmpl, (tw, th), interpolation=cv2.INTER_AREA)
-            res = cv2.matchTemplate(small_roi, tmpl, cv2.TM_CCOEFF_NORMED)
-            _, score, _, _ = cv2.minMaxLoc(res)
-            if score > best_score:
-                best_score = float(score)
-                # Short-circuit on confident match
-                if best_score >= 0.85:
-                    break
+        # 1. Prefer full banner template matching (zero false positives on road)
+        if self.banner_template is not None:
+            base_w = max(16, int((w / 800.0) * self.banner_template.shape[1] * 0.5))
+            base_h = max(16, int((h / 600.0) * self.banner_template.shape[0] * 0.5))
+            for s in scales:
+                tw = int(base_w * s)
+                th = int(base_h * s)
+                if tw >= small_roi.shape[1] or th >= small_roi.shape[0] or tw < 16 or th < 16:
+                    continue
+                tmpl = cv2.resize(self.banner_template, (tw, th), interpolation=cv2.INTER_AREA)
+                res = cv2.matchTemplate(small_roi, tmpl, cv2.TM_CCOEFF_NORMED)
+                _, score, _, _ = cv2.minMaxLoc(res)
+                if score > best_score:
+                    best_score = float(score)
+                    if best_score >= 0.70:
+                        break
+            # Full banner match threshold: 0.65
+            if best_score >= 0.65:
+                return True, best_score
 
-        is_detected = best_score >= self.prompt_threshold
+        # 2. Fallback to button icon template (requires high confidence >= 0.85 to avoid asphalt noise)
+        if self.templates:
+            badge_tmpl = self.templates[0]
+            base_w = max(4, badge_tmpl.shape[1] // 2)
+            base_h = max(4, badge_tmpl.shape[0] // 2)
+            for s in scales:
+                tw = int(base_w * s)
+                th = int(base_h * s)
+                if tw >= small_roi.shape[1] or th >= small_roi.shape[0] or tw < 8 or th < 8:
+                    continue
+                tmpl = cv2.resize(badge_tmpl, (tw, th), interpolation=cv2.INTER_AREA)
+                res = cv2.matchTemplate(small_roi, tmpl, cv2.TM_CCOEFF_NORMED)
+                _, score, _, _ = cv2.minMaxLoc(res)
+                if score > best_score:
+                    best_score = float(score)
+                    if best_score >= 0.88:
+                        break
+
+        # A tiny badge alone requires confident correlation >= 0.85
+        is_detected = best_score >= 0.85
         return is_detected, best_score
 
     def check_biome_floor_dominance(self, frame_bgr: np.ndarray) -> Tuple[bool, str, float]:
@@ -652,34 +676,71 @@ class GameStateDetector:
         else:
             biome = "neutral_track"
 
-        # Threshold: if floor color covers >= 65% of the road area, the road is lost
+        # Threshold: on an elevated racetrack, scenic floor in the background can reach 40-75%.
+        # True off-track floor dominance (when car has fallen off and no road is in view) covers >= 65%.
         is_dominated = max_ratio >= 0.65
         return is_dominated, biome, float(max_ratio)
 
     def detect_fall_or_crash(
         self,
         frame_bgr: np.ndarray,
+        corridor_detected: bool = False,
     ) -> Tuple[bool, bool, bool, float, float]:
         """Detect both falling off track and in-game respawn banner.
 
         Returns:
             (is_terminal, is_falling, is_respawn_prompt, laplacian_variance, prompt_score)
         """
-        is_falling, lap_var = self.detect_fall(frame_bgr)
+        is_falling, lap_var = self.detect_fall(frame_bgr, corridor_detected=corridor_detected)
         is_respawn, prompt_score = self.detect_respawn_prompt(frame_bgr)
         is_terminal = is_falling or is_respawn
         return is_terminal, is_falling, is_respawn, lap_var, prompt_score
 
-    def detect_fall(self, frame_bgr: np.ndarray) -> Tuple[bool, float]:
+    def is_on_track(self, frame_bgr: np.ndarray) -> Tuple[bool, str]:
+        """Determine whether PolyTrack is showing an active race (vs menu/lobby screen).
+
+        Distinguishing features:
+        - The PolyTrack sky is light blue/cyan with high brightness (V > 140) and sits at the top.
+        - The PolyTrack menu is dark navy-blue panels (V in [20, 90], S in [60, 200]) that cover
+          the ENTIRE screen including the bottom region where the road and car normally reside.
+        - During an active race, the bottom-center region always contains the player's car,
+          asphalt, or track elements — NEVER a dark navy UI panel.
+
+        Returns:
+            (is_racing, reason_str)
+        """
+        h, w = frame_bgr.shape[:2]
+        # Inspect specifically the bottom 45% where car and road must exist in gameplay
+        bottom_roi = frame_bgr[int(h * 0.55) :, :]
+        roi_small = cv2.resize(bottom_roi, (80, 40), interpolation=cv2.INTER_NEAREST)
+        roi_hsv = cv2.cvtColor(roi_small, cv2.COLOR_BGR2HSV)
+        total_px = 80 * 40
+
+        # Dark navy UI menu color: H in [100, 145], S in [60, 220], dark V in [20, 90]
+        # (Bright sky has V > 140 and will NEVER match this)
+        dark_navy_ui_mask = cv2.inRange(
+            roi_hsv,
+            np.array([100, 60, 20], dtype=np.uint8),
+            np.array([145, 220, 90], dtype=np.uint8),
+        )
+        ratio_navy_ui = cv2.countNonZero(dark_navy_ui_mask) / float(total_px)
+
+        # In menu, dark navy UI covers > 55% of the bottom area (level cards, buttons)
+        if ratio_navy_ui > 0.55:
+            return False, f"menu_ui_detected (navy_ratio={ratio_navy_ui:.2f})"
+
+        return True, f"on_track (navy_ratio={ratio_navy_ui:.2f})"
+
+    def detect_fall(self, frame_bgr: np.ndarray, corridor_detected: bool = False) -> Tuple[bool, float]:
         """Detect if the car has fallen off the track.
 
         Method:
-        1. When falling into empty void or sky, spatial edge variance (Laplacian variance) collapses.
-        2. When falling towards the floor in Polytrack, the lower screen is dominated by the
-           seasonal biome floor color:
-           - Summer: Green grass/plain floor
-           - Desert: Orange-brown sand floor
-           - Winter: White snow/ice floor
+        1. If a track corridor is actively detected (curbstones/asphalt recognized),
+           the car is on the track! High floor_ratio in background is simply scenery
+           below elevated bridges/viaducts.
+        2. When falling into empty void or sky, spatial edge variance (Laplacian variance) collapses.
+        3. When falling towards the floor in Polytrack, the lower screen is dominated by the
+           seasonal biome floor color (grass, desert sand, snow) with NO road corridor visible.
 
         Returns: (is_falling, laplacian_variance)
         """
@@ -693,17 +754,22 @@ class GameStateDetector:
         self.last_detected_biome = biome
         self.last_floor_ratio = floor_ratio
 
-        # Fall occurs if:
-        # - General edge variance collapses (< threshold), OR
-        # - Floor color dominates the road view (>= 65%) with low road edge variance
-        is_fall_frame = (lap_var < self.variance_threshold) or (is_floor_dominated and lap_var < self.variance_threshold * 1.5)
+        # Active corridor guard: if road corridor is detected, the car is ON the track!
+        if corridor_detected:
+            self.fall_streak = max(0, self.fall_streak - 1)
+            return False, lap_var
+
+        # Fall occurs ONLY if corridor is NOT detected AND:
+        # - General edge variance collapses (< threshold: void/sky), OR
+        # - Floor color dominates the road view (car fell off elevated track onto grass/sand/snow)
+        is_fall_frame = (lap_var < self.variance_threshold) or is_floor_dominated
 
         if is_fall_frame:
             self.fall_streak += 1
         else:
             self.fall_streak = max(0, self.fall_streak - 1)
 
-        is_falling = self.fall_streak >= config.FALL_CONSECUTIVE_FRAMES
+        is_falling = self.fall_streak >= 3
         return is_falling, lap_var
 
     def get_hud_timer_roi(self, frame_bgr: np.ndarray) -> np.ndarray:
@@ -759,7 +825,16 @@ class PolytrackHarness:
         return None
 
     def ensure_window_focus(self) -> bool:
-        """Ensure Polytrack window is restored, in foreground, and game canvas has keyboard focus."""
+        """Ensure Polytrack window is restored, in foreground, and game canvas has keyboard focus.
+        
+        Strategy:
+        1. Find HWND from saved metadata or live window search.
+        2. Restore + SetForegroundWindow (standard approach).
+        3. AllowSetForegroundWindow hack (bypasses Windows foreground lock).
+        4. BringWindowToTop as additional escalation.
+        5. Physical mouse click at center of game viewport (gives keyboard focus to canvas).
+        6. PostMessage WM_LBUTTONDOWN/UP to HWND directly (fallback for browser-hosted game).
+        """
         if sys.platform != "win32" or self.fallback_synthetic:
             return True
 
@@ -776,24 +851,58 @@ class PolytrackHarness:
             target = polytrack_matches[0] if polytrack_matches else (windows[0] if windows else None)
             if target:
                 hwnd = target[0]
-                self.save_calibration(target[2].to_mss_dict(), metadata={"window_title": target[1], "hwnd": hwnd})
+                self.saved_metadata = {"window_title": target[1], "hwnd": hwnd}
+                # Update bbox from window rect if it changed
+                new_bbox = target[2].to_mss_dict()
+                if new_bbox.get("width", 0) > 200 and new_bbox.get("height", 0) > 150:
+                    self.save_calibration(new_bbox, metadata=self.saved_metadata)
 
-        if hwnd and user32.IsWindow(hwnd):
-            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-            user32.SetForegroundWindow(hwnd)
+        if not hwnd or not user32.IsWindow(hwnd):
+            logger.warning("ensure_window_focus: Could not find valid PolyTrack HWND")
+            return False
+
+        # Step 1: Allow this process to set foreground (bypasses Windows 7+ foreground lock)
+        try:
+            current_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+            user32.AllowSetForegroundWindow(0xFFFFFFFF)  # ASFW_ANY
+        except Exception:
+            pass
+
+        # Step 2: Restore, bring to top, set foreground
+        user32.ShowWindow(hwnd, 9)      # SW_RESTORE
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        time.sleep(0.12)               # Give Windows time to switch focus
+
+        # Step 3: Physical mouse click at center of game viewport (gives canvas keyboard focus)
+        if self.bbox:
+            cx = self.bbox["left"] + self.bbox["width"] // 2
+            cy = self.bbox["top"] + self.bbox["height"] // 2
+            user32.SetCursorPos(cx, cy)
+            user32.mouse_event(2, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+            time.sleep(0.03)
+            user32.mouse_event(4, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
             time.sleep(0.08)
 
-            # Click center of game viewport to give keyboard focus to the game canvas
-            if self.bbox:
-                cx = self.bbox["left"] + self.bbox["width"] // 2
-                cy = self.bbox["top"] + self.bbox["height"] // 2
-                user32.SetCursorPos(cx, cy)
-                user32.mouse_event(2, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
-                time.sleep(0.02)
-                user32.mouse_event(4, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
-                time.sleep(0.05)
-            return True
-        return False
+        # Step 4: PostMessage WM_LBUTTONDOWN/UP directly to HWND canvas
+        # (catches browser-embedded games where physical click may go to wrong element)
+        try:
+            WM_LBUTTONDOWN = 0x0201
+            WM_LBUTTONUP = 0x0202
+            # Calculate click position relative to client window (center of client area)
+            client_rect = ctypes.wintypes.RECT()
+            user32.GetClientRect(hwnd, ctypes.byref(client_rect))
+            cx_client = (client_rect.right - client_rect.left) // 2
+            cy_client = (client_rect.bottom - client_rect.top) // 2
+            lparam = (cy_client << 16) | (cx_client & 0xFFFF)
+            user32.PostMessageW(hwnd, WM_LBUTTONDOWN, 1, lparam)
+            time.sleep(0.02)
+            user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, lparam)
+        except Exception as e:
+            logger.debug(f"PostMessage click failed (non-critical): {e}")
+
+        time.sleep(0.05)
+        return True
 
     def save_calibration(self, bbox: Dict[str, int], metadata: Optional[Dict[str, Any]] = None) -> None:
         """Save bounding box calibration to json file."""

@@ -8,32 +8,42 @@ echo       ЗАПУСК ПОЛНОГО КОМПЛЕКСА ТЕСТОВ СИСТ�
 echo ===================================================================
 echo.
 
-echo [1/6] Тестирование захвата и эмулятора (game_harness)...
+echo [1/8] Тестирование захвата и эмулятора (game_harness)...
 python test_harness.py
 if errorlevel 1 goto failed
 
 echo.
-echo [2/6] Тестирование сетчатки и оптического потока (retina)...
+echo [2/8] Тестирование сетчатки и оптического потока (retina)...
 python test_retina.py
 if errorlevel 1 goto failed
 
 echo.
-echo [3/6] Тестирование графа коннектома FlyWire (connectome_loader)...
+echo [3/8] Тестирование графа коннектома FlyWire (connectome_loader)...
 python test_connectome.py
 if errorlevel 1 goto failed
 
 echo.
-echo [4/6] Тестирование спайкового мозга дрозофилы (fly_brain)...
+echo [4/8] Тестирование спайкового мозга дрозофилы (fly_brain)...
 python test_brain.py
 if errorlevel 1 goto failed
 
 echo.
-echo [5/6] Тестирование менеджера весов и сброса мозга (brain_manager)...
+echo [5/8] Тестирование детектора границ и поребриков (boundary_detector)...
+python test_boundary_detector.py
+if errorlevel 1 goto failed
+
+echo.
+echo [6/8] Тестирование прозрачного оверлея коннектома (neural_overlay)...
+python test_overlay.py
+if errorlevel 1 goto failed
+
+echo.
+echo [7/8] Тестирование менеджера весов и сброса мозга (brain_manager)...
 python test_brain_manager.py
 if errorlevel 1 goto failed
 
 echo.
-echo [6/6] Тестирование системного контура и тренера (system & trainer)...
+echo [8/8] Тестирование системного контура и тренера (system & trainer)...
 python test_system.py
 if errorlevel 1 goto failed
 

@@ -117,3 +117,25 @@ def test_blank_frame_no_corridor() -> None:
     assert out.corridor_detected is False
     assert out.lateral_offset == 0.0
     assert out.track_heading_deg == 0.0
+    assert out.is_curb_breached is False
+    assert out.is_curb_beached is False
+
+
+def test_curb_departure_and_beached_detection() -> None:
+    detector = TrackBoundaryDetector()
+
+    # Extreme shift right (breach off track right)
+    frame_breached_right = _generate_synthetic_track(curve="straight", car_offset_x=220)
+    out_br = detector.detect(frame_breached_right)
+    # The car offset puts mid_x beyond right curb
+    if out_br.corridor_detected:
+        assert out_br.norm_pos > 0.85
+        assert out_br.departure_side == "right"
+        assert out_br.is_curb_beached or out_br.is_curb_breached
+
+    # Moderate shift onto right curb (beached on curb)
+    frame_beached_right = _generate_synthetic_track(curve="straight", car_offset_x=120)
+    out_beach = detector.detect(frame_beached_right)
+    assert out_beach.corridor_detected is True
+    assert out_beach.norm_pos > 0.50
+

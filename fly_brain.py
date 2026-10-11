@@ -55,10 +55,17 @@ class BrainInferenceOutput:
 
 
 class PlasticInputAdapter(nn.Module):
-    """Plastic linear projection mapping retina sensory currents to LPTC neurons.
+    """Plastic spatial receptive field adapter mapping retina sensory currents to LPTC neurons.
 
-    Input: 2004 channels (512 ommatidia + 512 delta + 496 EMD_x + 480 EMD_y + 4 LPTC).
-    Output: 26 LPTC neurons (HS_L: 3, HS_R: 3, VS_L: 10, VS_R: 10).
+    Instead of an unconstrained 52,130-weight dense matrix, each of the 26 LPTC neurons
+    is parameterized by biologically structured 2D Gaussian spatial receptive fields:
+    - (c_y, c_x): 2D center coordinate on retina ommatidia grid (16 rows x 32 columns)
+    - sigma: angular spatial spread / receptive field width
+    - g_flow: directional optic flow sensitivity (EMD_x for HS, EMD_y for VS)
+    - g_macro: sensitivity to pre-aggregated biological lobula plate channels
+
+    Total parameters: 26 neurons * 5 parameters = 130 parameters!
+    Forward pass projects (Batch, 2004) -> (Batch, 26) with sub-millisecond latency.
     """
 
     def __init__(
@@ -69,40 +76,83 @@ class PlasticInputAdapter(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.linear = nn.Linear(in_features, out_features, bias=True)
+        # 26 neurons x 5 parameters: [c_y, c_x, sigma, g_flow, g_macro]
+        self.rf_params = nn.Parameter(torch.zeros(out_features, 5, dtype=torch.float32))
+        self._cached_W: Optional[torch.Tensor] = None
         self._init_biological_weights()
 
     def _init_biological_weights(self) -> None:
         """Initialize receptive field weights aligned with Drosophila visual neurobiology."""
         with torch.no_grad():
-            # Small baseline noise
-            self.linear.weight.data.normal_(0.0, 0.01)
-            self.linear.bias.data.zero_()
+            # 26 LPTC neurons:
+            # 0..2: HS_L (North, Equatorial, South) - Left Eye horizontal flow
+            for i, cy in enumerate([0.25, 0.50, 0.75]):
+                self.rf_params.data[i] = torch.tensor([cy, 0.25, 0.35, 1.2, 2.0])
 
-            # The last 4 features of retina are pre-aggregated biological signals:
-            # [-4: HS_Left, -3: HS_Right, -2: VS_Forward, -1: Net Yaw]
-            # Connect these strongly to the respective LPTC sub-populations:
-            # LPTC indices:
-            # 0..2:   HS_L (North, Equatorial, South)
-            # 3..5:   HS_R (North, Equatorial, South)
-            # 6..15:  VS_L (VS1..VS10)
-            # 16..25: VS_R (VS1..VS10)
+            # 3..5: HS_R (North, Equatorial, South) - Right Eye horizontal flow
+            for i, cy in enumerate([0.25, 0.50, 0.75]):
+                self.rf_params.data[3 + i] = torch.tensor([cy, 0.75, 0.35, 1.2, 2.0])
 
-            # Left HS tangentials receive left horizontal flow and progressive yaw
-            self.linear.weight.data[0:3, -4] += 1.5   # HS_Left feature
-            self.linear.weight.data[0:3, -1] += 1.0   # Yaw feature
+            # 6..15: VS_L (VS1..VS10) - 10 vertical strips across left eye
+            for i in range(10):
+                cx = 0.05 + 0.04 * i
+                self.rf_params.data[6 + i] = torch.tensor([0.50, cx, 0.25, 1.0, 1.5])
 
-            # Right HS tangentials receive right horizontal flow
-            self.linear.weight.data[3:6, -3] += 1.5   # HS_Right feature
-            self.linear.weight.data[3:6, -1] -= 1.0   # Negative yaw
+            # 16..25: VS_R (VS1..VS10) - 10 vertical strips across right eye
+            for i in range(10):
+                cx = 0.55 + 0.04 * i
+                self.rf_params.data[16 + i] = torch.tensor([0.50, cx, 0.25, 1.0, 1.5])
 
-            # Vertical VS tangentials receive forward optic flow expansion
-            self.linear.weight.data[6:16, -2] += 1.2  # VS_Forward feature
-            self.linear.weight.data[16:26, -2] += 1.2
+            self._rebuild_weight_matrix()
+
+    def _rebuild_weight_matrix(self) -> torch.Tensor:
+        """Construct full (26, 2004) projection matrix from 130 spatial RF parameters."""
+        device = self.rf_params.device
+        W = torch.zeros(self.out_features, self.in_features, device=device)
+
+        grid_h, grid_w = 16, 32
+        ys = torch.linspace(0.0, 1.0, grid_h, device=device)
+        xs = torch.linspace(0.0, 1.0, grid_w, device=device)
+        gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+
+        cy = self.rf_params[:, 0:1, None]
+        cx = self.rf_params[:, 1:2, None]
+        sigma = torch.clamp(self.rf_params[:, 2:3, None], min=0.06, max=1.2)
+        g_flow = self.rf_params[:, 3:4, None]
+        g_macro = self.rf_params[:, 4]
+
+        dist_sq = (gy.unsqueeze(0) - cy) ** 2 + (gx.unsqueeze(0) - cx) ** 2
+        gauss = torch.exp(-dist_sq / (2.0 * sigma ** 2))
+        norm_gauss = gauss / (gauss.sum(dim=(1, 2), keepdim=True) + 1e-6)
+
+        # 1. HS neurons (0..5) receive horizontal optic flow EMD_x (16 x 31) -> indices 1024..1519
+        gauss_emdx = norm_gauss[:6, :, :31].reshape(6, -1) * g_flow[:6].squeeze(-1)
+        W[:6, 1024:1520] = gauss_emdx
+        # Macro lobula plate channels:
+        # 2000: HS_Left, 2001: HS_Right, 2002: VS_Forward, 2003: Net Yaw
+        W[0:3, 2000] = g_macro[0:3]
+        W[0:3, 2003] = 0.5 * g_macro[0:3]
+        W[3:6, 2001] = g_macro[3:6]
+        W[3:6, 2003] = -0.5 * g_macro[3:6]
+
+        # 2. VS neurons (6..25) receive vertical optic flow EMD_y (15 x 32) -> indices 1520..1999
+        gauss_emdy = norm_gauss[6:26, :15, :].reshape(20, -1) * g_flow[6:26].squeeze(-1)
+        W[6:26, 1520:2000] = gauss_emdy
+        # Macro VS channel:
+        W[6:26, 2002] = g_macro[6:26]
+
+        self._cached_W = W
+        return W
+
+    def get_weight(self) -> torch.Tensor:
+        if self._cached_W is None:
+            self._rebuild_weight_matrix()
+        return self._cached_W
 
     def forward(self, retina_tensor: torch.Tensor) -> torch.Tensor:
         """Project (Batch, 2004) -> (Batch, 26)."""
-        return self.linear(retina_tensor)
+        W = self.get_weight()
+        return torch.matmul(retina_tensor, W.t())
 
 
 class LIFConnectomeCore(nn.Module):
@@ -194,9 +244,31 @@ class PlasticMotorDecoder(nn.Module):
         self.dn_indices = [connectome.name_to_idx[name] for name in self.dn_names]
 
         # Learnable linear readout layer for fine-tuning via Evolutionary Strategies
-        # Maps 8 DN rates -> 4 action logits [W, A, S, D]
+        # Maps 8 DN rates -> 4 action logits [W, A, S, D] (32 weights + 4 biases = 36 params)
         self.readout = nn.Linear(len(self.dn_names), 4, bias=True)
+
+        # 4 plastic modulation parameters for speed-steering coupling & trail braking:
+        # [0: w_turn_decel, 1: w_constrict_brake, 2: w_looming_dn, 3: w_curb_anticipate]
+        # Total motor params: 36 + 4 = 40 (Total genome: 130 + 40 = 170 params)
+        self.modulation_params = nn.Parameter(
+            torch.tensor([0.45, 0.60, 0.50, 0.70], dtype=torch.float32)
+        )
+        self.smoothed_steer_demand: float = 0.0
+        self._steer_filter_initialized: bool = False
+        self.prev_lateral_offset: Optional[float] = None
+        self.active_steer: str = "none"  # "none", "a", "d"
+        self.lockout_counter: int = 0    # Frames of neutral steering lockout when changing direction
+        self.steer_hold_counter: int = 0 # Frames active steering key has been held
         self._init_readout_weights()
+
+    def reset(self) -> None:
+        """Reset internal temporal smoothing filter and anti-chatter state."""
+        self.smoothed_steer_demand = 0.0
+        self._steer_filter_initialized = False
+        self.prev_lateral_offset = None
+        self.active_steer = "none"
+        self.lockout_counter = 0
+        self.steer_hold_counter = 0
 
     def _init_readout_weights(self) -> None:
         """Initialize motor readout weights matching Drosophila descending physiology."""
@@ -238,15 +310,15 @@ class PlasticMotorDecoder(nn.Module):
         mean_dn_spikes: torch.Tensor,
         vs_forward: float = 0.0,
         boundary: Optional[Any] = None,
+        smooth: bool = True,
     ) -> Tuple[Dict[str, bool], Dict[str, float]]:
         """Decode descending neuron firing rates into discrete WASD key actions and probabilities.
 
-        Biological Centering Reflex:
-        Incorporate Optomotor Centering Response when track curbs are perceived:
-        - Car drifted right (offset > 0) -> stimulates Left turn 'A'
-        - Car drifted left (offset < 0) -> stimulates Right turn 'D'
-        - Road curves right/left ahead -> anticipatory steering into the apex
-        - Proximity risk to curb > 0.75 -> emergency wall avoidance
+        Biological Centering & Speed-Steering Coupling Reflex:
+        1. Optomotor Centering Response: Steers away from curbs, keeping car centered in corridor.
+        2. Looming Hazard Override: Suppresses far-horizon turn commands that steer into adjacent walls.
+        3. Trail Deceleration & Throttle Lift: Modulates W and S before sharp chicanes/bottlenecks
+           via 4 plastic parameters [w_turn_decel, w_constrict_brake, w_looming_dn, w_curb_anticipate].
 
         Constraint:
         In Polytrack, 'S' engages reverse gear if the car is stationary or moving backward.
@@ -263,53 +335,184 @@ class PlasticMotorDecoder(nn.Module):
         prob_s = float(probs[2].item())
         prob_d = float(probs[3].item())
 
+        # Unpack plastic modulation parameters
+        w_turn_decel = float(torch.clamp(self.modulation_params[0], min=0.0, max=2.0).item())
+        w_constrict_brake = float(torch.clamp(self.modulation_params[1], min=0.0, max=2.0).item())
+        w_looming_dn = float(torch.clamp(self.modulation_params[2], min=0.0, max=2.0).item())
+        w_curb_anticipate = float(torch.clamp(self.modulation_params[3], min=0.0, max=2.0).item())
+
+        is_emergency_left = False
+        is_emergency_right = False
+
         # Biological Optomotor Centering Reflex (Curridor Centering)
         if boundary is not None and getattr(boundary, "corridor_detected", False):
-            # Centering demand: positive = steer right, negative = steer left
-            # -1.2 * offset: offset > 0 (car is right of center) -> demand negative (steer left)
-            # +0.8 * heading: heading > 0 (road curves right) -> demand positive (steer right)
-            heading_norm = float(np.clip(boundary.track_heading_deg / 45.0, -1.5, 1.5))
-            steer_demand = float(-1.2 * boundary.lateral_offset + 0.8 * heading_norm)
+            imm_heading = getattr(boundary, "immediate_heading_deg", boundary.track_heading_deg)
+            far_heading = boundary.track_heading_deg
+            prox_l = getattr(boundary, "proximity_left", 0.0)
+            prox_r = getattr(boundary, "proximity_right", 0.0)
+
+            imm_norm = float(np.clip(imm_heading / 45.0, -1.5, 1.5))
+            far_norm = float(np.clip(far_heading / 45.0, -1.5, 1.5))
+
+            # Suppress distant horizon turn if an immediate obstacle on a straight blocks that side
+            if prox_r > 0.50 and imm_norm <= 0.10 and far_norm > 0:
+                far_norm = max(0.0, far_norm * (1.0 - prox_r))
+            if prox_l > 0.50 and imm_norm >= -0.10 and far_norm < 0:
+                far_norm = min(0.0, far_norm * (1.0 - prox_l))
+
+            effective_heading = 0.65 * imm_norm + 0.35 * far_norm
+
+            # PD Damping: compute lateral drift rate (derivative) to counter overshooting center
+            if self.prev_lateral_offset is not None:
+                drift_rate = float(boundary.lateral_offset - self.prev_lateral_offset)
+            else:
+                drift_rate = 0.0
+            self.prev_lateral_offset = float(boundary.lateral_offset)
+
+            # Combined PD Steer demand: Proportional curb centering + Derivative damping + Heading guidance
+            raw_steer_demand = float(
+                -0.75 * boundary.lateral_offset * w_curb_anticipate
+                - 1.20 * drift_rate
+                + 1.15 * effective_heading
+            )
+
+            # Deadband on straights: eliminate micro-oscillations and snaking/fish-tailing
+            if abs(effective_heading) < 0.10 and abs(boundary.lateral_offset) < 0.10 and abs(raw_steer_demand) < 0.08:
+                raw_steer_demand = 0.0
+
+            if smooth:
+                # EMA Temporal Smoothing: alpha = 0.35 provides smooth ~60ms damping against chatter
+                if not self._steer_filter_initialized:
+                    self.smoothed_steer_demand = raw_steer_demand
+                    self._steer_filter_initialized = True
+                else:
+                    self.smoothed_steer_demand = 0.35 * raw_steer_demand + 0.65 * self.smoothed_steer_demand
+                steer_demand = self.smoothed_steer_demand
+            else:
+                steer_demand = raw_steer_demand
 
             if steer_demand > 0.05:
                 # Steer rightward
-                prob_d = min(1.0, prob_d + steer_demand * 0.35)
-                prob_a = max(0.0, prob_a - steer_demand * 0.20)
+                prob_d = min(1.0, prob_d + steer_demand * 0.40)
+                prob_a = max(0.0, prob_a - steer_demand * 0.25)
             elif steer_demand < -0.05:
                 # Steer leftward
-                prob_a = min(1.0, prob_a + (-steer_demand) * 0.35)
-                prob_d = max(0.0, prob_d - (-steer_demand) * 0.20)
+                prob_a = min(1.0, prob_a + (-steer_demand) * 0.40)
+                prob_d = max(0.0, prob_d - (-steer_demand) * 0.25)
 
-            # Emergency wall / curb avoidance
-            if getattr(boundary, "proximity_left", 0.0) > 0.75:
-                prob_d = max(prob_d, 0.75)
-                prob_a = min(prob_a, 0.25)
-            elif getattr(boundary, "proximity_right", 0.0) > 0.75:
-                prob_a = max(prob_a, 0.75)
-                prob_d = min(prob_d, 0.25)
+            # Emergency wall repulsion: ONLY activate if the road is NOT actively curving in that direction!
+            # (If the road curves right, approaching the right apex is intentional and must NEVER steer left into the void!)
+            if prox_l > 0.70 and effective_heading >= -0.15:
+                prob_d = max(prob_d, 0.75 + prox_l * 0.20)
+                prob_a = min(prob_a, 0.15)
+                is_emergency_left = True
+            elif prox_r > 0.70 and effective_heading <= 0.15:
+                prob_a = max(prob_a, 0.75 + prox_r * 0.20)
+                prob_d = min(prob_d, 0.15)
+                is_emergency_right = True
+        else:
+            self.smoothed_steer_demand = 0.80 * self.smoothed_steer_demand
+            self.prev_lateral_offset = None
 
-        # Mutually exclusive steering: cannot press A and D at the same time
-        steer_a = prob_a > 0.5 and (prob_a > prob_d)
-        steer_d = prob_d > 0.5 and (prob_d > prob_a)
+        # Speed-Steering Coupling & Trail Deceleration:
+        turn_severity = float(np.clip(abs(prob_a - prob_d), 0.0, 1.0))
+        constriction = float(getattr(boundary, "constriction_risk", 0.0)) if boundary is not None else 0.0
+        # DNb01 braking descending neurons (indices 6 and 7)
+        dnb_activity = float(torch.clamp((mean_dn_spikes[0, 6] + mean_dn_spikes[0, 7]) * 0.5, 0.0, 1.0).item())
+
+        decel_demand = float(
+            (turn_severity * w_turn_decel * 0.40)
+            + (constriction * w_constrict_brake * 0.55)
+            + (dnb_activity * w_looming_dn * 0.40)
+        )
+
+        # Modulate throttle and brake when entering severe chicanes or constricted passages
+        if decel_demand > 0.25 and vs_forward > 0.005:
+            prob_w = max(0.15, prob_w - decel_demand * 0.60)
+            prob_s = min(0.95, prob_s + decel_demand * 0.65)
+
+        # Schmitt Trigger with Hysteresis & Neutral Cadence Lockout:
+        p_on = 0.51      # Threshold to engage steering from neutral
+        p_off = 0.44     # Lower threshold to maintain already engaged steering
+        min_diff = 0.03  # Minimum probability dominance over opposing direction
+
+        steer_a = False
+        steer_d = False
+
+        if is_emergency_left or is_emergency_right:
+            # Emergency wall reflex overrides neutral pause and immediately counter-steers
+            self.lockout_counter = 0
+            if is_emergency_left:
+                self.active_steer = "d"
+                steer_d = True
+            else:
+                self.active_steer = "a"
+                steer_a = True
+        else:
+            if self.active_steer == "a":
+                # Currently turning Left
+                if prob_a >= p_off and prob_a >= prob_d:
+                    self.steer_hold_counter += 1
+                    steer_a = True
+                else:
+                    # Release A: enforce neutral pause before allowing D
+                    self.active_steer = "none"
+                    self.lockout_counter = 1  # 2 frames (~33ms total) neutral pause
+                    self.steer_hold_counter = 0
+                    steer_a = False
+                    steer_d = False
+            elif self.active_steer == "d":
+                # Currently turning Right
+                if prob_d >= p_off and prob_d >= prob_a:
+                    self.steer_hold_counter += 1
+                    steer_d = True
+                else:
+                    # Release D: enforce neutral pause before allowing A
+                    self.active_steer = "none"
+                    self.lockout_counter = 1  # 2 frames (~33ms total) neutral pause
+                    self.steer_hold_counter = 0
+                    steer_a = False
+                    steer_d = False
+            else:
+                # In Neutral
+                if self.lockout_counter > 0:
+                    self.lockout_counter -= 1
+                    steer_a = False
+                    steer_d = False
+                else:
+                    if prob_a > p_on and (prob_a > prob_d + min_diff):
+                        self.active_steer = "a"
+                        self.steer_hold_counter = 1
+                        steer_a = True
+                    elif prob_d > p_on and (prob_d > prob_a + min_diff):
+                        self.active_steer = "d"
+                        self.steer_hold_counter = 1
+                        steer_d = True
+                    else:
+                        self.active_steer = "none"
+                        self.steer_hold_counter = 0
+                        steer_a = False
+                        steer_d = False
+
         is_turning = steer_a or steer_d
 
-        # Forward throttle W is the default mode of racing (car never stops accelerating by default)
-        action_w = bool(prob_w > 0.25)
+        # Forward throttle W: drops if prob_w falls below 0.35 during deceleration
+        action_w = bool(prob_w > 0.35)
 
         # Brake / Drift constraint:
-        # Car must have positive forward momentum (vs_forward > 0.003) to be physically allowed to brake or drift.
-        # From standstill (vs_forward <= 0.003), 'S' is strictly locked out (preventing reverse gear).
         can_brake = vs_forward > 0.003
         if not can_brake:
             action_s = False
         else:
             if is_turning:
-                # In turns: allow simultaneous W and S for drifting / power sliding!
-                action_s = bool(prob_s > 0.55)
+                # In turns: allow simultaneous W and S for drifting / power sliding / trail braking!
+                brake_th = 0.42 if decel_demand > 0.25 else 0.52
+                action_s = bool(prob_s > brake_th)
             else:
-                # On straights: heavy braking cuts throttle
-                if prob_s > 0.65 and prob_s > prob_w:
-                    action_w = False
+                # On straights: heavy braking cuts throttle or slows down before bottleneck
+                if prob_s > 0.55:
+                    if prob_s > prob_w:
+                        action_w = False
                     action_s = True
                 else:
                     action_s = False
@@ -361,8 +564,9 @@ class FlyBrain(nn.Module):
         self.reset()
 
     def reset(self) -> None:
-        """Reset internal membrane potentials and spike buffers."""
+        """Reset internal membrane potentials, spike buffers, and motor smoothing filters."""
         self.connectome_core.reset_state(batch_size=1)
+        self.motor_decoder.reset()
 
     @torch.no_grad()
     def forward_frame(
@@ -469,11 +673,16 @@ class FlyBrain(nn.Module):
             chunk = flat_params[idx : idx + n_el]
             p.data.copy_(torch.from_numpy(chunk.reshape(p.shape)).float().to(self.device))
             idx += n_el
+        self.input_adapter._rebuild_weight_matrix()
 
     def reset_to_baseline(self) -> None:
         """Reset plastic layers (Input Adapter & Motor Decoder) to default biological baseline weights."""
         self.input_adapter._init_biological_weights()
         self.motor_decoder._init_readout_weights()
+        with torch.no_grad():
+            self.motor_decoder.modulation_params.data.copy_(
+                torch.tensor([0.45, 0.60, 0.50, 0.70], dtype=torch.float32)
+            )
         logger.info("FlyBrain plastic layers reset to biological baseline weights.")
 
     def save_baseline(self, filepath: Optional[Path] = None) -> Path:
@@ -487,7 +696,7 @@ class FlyBrain(nn.Module):
                 "best_fitness": 0.0,
                 "generation": 0,
                 "saved_at": time.time(),
-                "description": "Default physiological initial weights (receptive fields + motor thresholds)",
+                "description": "Default physiological initial weights (170 params: receptive fields + motor thresholds + modulation)",
             },
         )
         return target_path
@@ -509,8 +718,22 @@ class FlyBrain(nn.Module):
         if not filepath.exists():
             raise FileNotFoundError(f"Weight file not found: {filepath}")
         ckpt = torch.load(filepath, map_location=self.device)
-        self.input_adapter.load_state_dict(ckpt["input_adapter"])
-        self.motor_decoder.load_state_dict(ckpt["motor_decoder"])
+        if isinstance(ckpt, dict) and "input_adapter" in ckpt:
+            if "rf_params" in ckpt["input_adapter"]:
+                self.input_adapter.load_state_dict(ckpt["input_adapter"])
+                self.input_adapter._rebuild_weight_matrix()
+            else:
+                logger.info("Legacy 52k-parameter checkpoint detected; initialized biological RF baseline.")
+                self.input_adapter._init_biological_weights()
+
+            if "motor_decoder" in ckpt:
+                md_state = ckpt["motor_decoder"]
+                if "readout.weight" in md_state:
+                    if "modulation_params" not in md_state:
+                        # Migrate legacy 166 checkpoint by appending default modulation parameters
+                        md_state = dict(md_state)
+                        md_state["modulation_params"] = torch.tensor([0.45, 0.60, 0.50, 0.70], dtype=torch.float32)
+                    self.motor_decoder.load_state_dict(md_state)
         logger.info(f"Loaded brain plastic weights from {filepath}")
         return ckpt
 

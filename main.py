@@ -33,6 +33,7 @@ import config
 from boundary_detector import BoundaryPerceptionOutput, TrackBoundaryDetector
 from fly_brain import BrainInferenceOutput, FlyBrain
 from game_harness import PolytrackHarness, ScreenCapture
+from neural_overlay import NeuralOverlayController
 from retina import DrosophilaRetina, RetinaOutput
 
 logger = logging.getLogger("PolytrackFlyMain")
@@ -51,9 +52,11 @@ class PolytrackOrchestrator:
         use_synthetic: bool = False,
         weights_path: Optional[Path] = None,
         device: str = config.DEVICE,
+        show_overlay: bool = True,
     ) -> None:
         self.use_synthetic = use_synthetic
         self.device = device
+        self.show_overlay = show_overlay
 
         # Initialize core components
         logger.info("Initializing Polytrack Game Harness...")
@@ -73,12 +76,24 @@ class PolytrackOrchestrator:
             logger.info(f"Loading custom plastic weights from {weights_path}...")
             self.brain.load_weights(Path(weights_path))
 
+        # In-Game Real-Time Neural Overlay (positioned at middle of right edge of game window)
+        self.overlay: Optional[NeuralOverlayController] = None
+        if self.show_overlay:
+            target_hwnd = getattr(getattr(self.harness, "capture", None), "hwnd", 0)
+            self.overlay = NeuralOverlayController(target_hwnd=target_hwnd)
+            self.overlay.start()
+
         # Runtime control states
         self.is_paused: bool = False
         self.autonomous_mode: bool = True
         self.step_counter: int = 0
         self.episode_start_time: float = time.time()
         self.survival_time_sec: float = 0.0
+        self.consecutive_respawns: int = 0
+        self.consecutive_falls: int = 0
+        self.consecutive_curb_breach: int = 0
+        self.consecutive_curb_beached: int = 0
+        self.episode_frames: int = 0
 
     def step(self) -> Tuple[np.ndarray, RetinaOutput, BrainInferenceOutput, Dict[str, Any]]:
         """Execute one complete synchronized cycle of the sensory-motor loop.
@@ -113,7 +128,12 @@ class PolytrackOrchestrator:
             }
         else:
             frame_bgr, cap_ms = self.harness.capture.grab_bgr()
-            is_terminal, is_falling, is_respawn, lap_var, prompt_score = self.harness.state_detector.detect_fall_or_crash(frame_bgr)
+            boundary_out = self.boundary_detector.detect(frame_bgr)
+            is_terminal, is_falling, is_respawn, lap_var, prompt_score = (
+                self.harness.state_detector.detect_fall_or_crash(
+                    frame_bgr, corridor_detected=boundary_out.corridor_detected
+                )
+            )
             hud_delta = self.harness.state_detector.check_hud_activity(frame_bgr)
             game_telem = {
                 "is_terminal": is_terminal,
@@ -127,7 +147,8 @@ class PolytrackOrchestrator:
         # -------------------------------------------------------------
         # Phase 2: Track Boundaries & Drosophila Retina
         # -------------------------------------------------------------
-        boundary_out = self.boundary_detector.detect(frame_bgr)
+        if self.use_synthetic:
+            boundary_out = self.boundary_detector.detect(frame_bgr)
         retina_out = self.retina.process(frame_bgr)
 
         # -------------------------------------------------------------
@@ -158,18 +179,90 @@ class PolytrackOrchestrator:
             input_ms = 0.0
             self.harness.inputs.release_all()
 
-        # Handle terminal conditions: respawn prompt or fall off track -> auto-reset game
-        if game_telem["is_terminal"]:
-            reason = "RESPAWN BANNER PROMPT" if game_telem["is_respawn_prompt"] else "FALL OFF TRACK"
-            logger.warning(f"Terminal condition detected ({reason})! Terminating attempt and resetting ('r')...")
-            if not self.use_synthetic:
-                self.harness.inputs.reset_game()
-            self.brain.reset()
-            self.retina.reset()
-            self.episode_start_time = time.time()
+        # Handle terminal conditions (Warmup grace period: first 60 frames ~1.0-1.5s protected)
+        self.episode_frames += 1
+        if self.episode_frames > 60:
+            if game_telem["is_respawn_prompt"]:
+                self.consecutive_respawns += 1
+            else:
+                self.consecutive_respawns = 0
+
+            # Curb breach check (car center crossed over outer curb)
+            if getattr(boundary_out, "is_curb_breached", False):
+                self.consecutive_curb_breach += 1
+            else:
+                self.consecutive_curb_breach = 0
+
+            # Curb beached check (car hanging on curb and motionless while holding throttle)
+            is_motionless_on_curb = (
+                getattr(boundary_out, "is_curb_beached", False)
+                and actions["w"]
+                and (retina_out.lptc_vs_forward < 0.002)
+            )
+            if is_motionless_on_curb:
+                self.consecutive_curb_beached += 1
+            else:
+                self.consecutive_curb_beached = 0
+
+            is_off_track = game_telem["is_falling"] and not boundary_out.corridor_detected
+            if is_off_track:
+                self.consecutive_falls += 1
+            else:
+                self.consecutive_falls = 0
+
+            if (
+                self.consecutive_respawns >= 2
+                or self.consecutive_curb_breach >= 3
+                or self.consecutive_curb_beached >= 12
+                or self.consecutive_falls >= 4
+            ):
+                if self.consecutive_curb_breach >= 3:
+                    side_str = getattr(boundary_out, "departure_side", "curb").upper()
+                    reason = f"CURB BREACHED ({side_str})"
+                elif self.consecutive_curb_beached >= 12:
+                    side_str = getattr(boundary_out, "departure_side", "curb").upper()
+                    reason = f"BEACHED ON CURB ({side_str})"
+                elif self.consecutive_respawns >= 2:
+                    reason = "RESPAWN BANNER PROMPT"
+                else:
+                    reason = "FALL OFF TRACK"
+                logger.warning(f"Terminal condition detected ({reason})! Terminating attempt and resetting ('r')...")
+                if not self.use_synthetic:
+                    self.harness.inputs.reset_game()
+                self.brain.reset()
+                self.retina.reset()
+                self.episode_start_time = time.time()
+                self.episode_frames = 0
+                self.consecutive_respawns = 0
+                self.consecutive_curb_breach = 0
+                self.consecutive_curb_beached = 0
+                self.consecutive_falls = 0
 
         total_loop_ms = (time.perf_counter() - t0) * 1000.0
         self.survival_time_sec = time.time() - self.episode_start_time
+
+        # Update in-game neural network overlay
+        if self.overlay:
+            curb_st = (
+                "breached"
+                if getattr(boundary_out, "is_curb_breached", False)
+                else ("beached" if getattr(boundary_out, "is_curb_beached", False) else "ok")
+            )
+            fps = 1000.0 / max(0.1, total_loop_ms)
+            self.overlay.update(
+                actions=actions,
+                action_probs=brain_out.action_probabilities,
+                dn_rates=brain_out.dn_spike_rates,
+                heading_deg=brain_out.compass_heading_deg,
+                vs_forward=retina_out.lptc_vs_forward,
+                hs_left=retina_out.lptc_hs_left,
+                hs_right=retina_out.lptc_hs_right,
+                lateral_offset=boundary_out.lateral_offset,
+                fitness=self.survival_time_sec * 10.0,
+                generation=0,
+                fps=fps,
+                curb_status=curb_st,
+            )
 
         telemetry = {
             "latency_total_ms": total_loop_ms,
@@ -431,6 +524,8 @@ class PolytrackOrchestrator:
                     self.episode_start_time = time.time()
 
         finally:
+            if self.overlay:
+                self.overlay.stop()
             self.harness.inputs.release_all()
             cv2.destroyAllWindows()
             print("\nClosed-loop agent stopped. All keyboard inputs released safely.\n")
@@ -442,6 +537,7 @@ def main() -> None:
     parser.add_argument("--synthetic", action="store_true", help="Run with synthetic Polytrack simulation")
     parser.add_argument("--weights", type=str, default=None, help="Path to trained plastic brain weights (.pt)")
     parser.add_argument("--calibrate", action="store_true", help="Calibrate Polytrack desktop window before running")
+    parser.add_argument("--no-overlay", action="store_true", help="Disable in-game neural network overlay")
 
     args = parser.parse_args()
 
@@ -453,6 +549,7 @@ def main() -> None:
     orchestrator = PolytrackOrchestrator(
         use_synthetic=args.synthetic,
         weights_path=Path(args.weights) if args.weights else None,
+        show_overlay=not args.no_overlay,
     )
     orchestrator.run()
 

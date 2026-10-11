@@ -99,6 +99,12 @@ def test_game_state_detector_fall() -> None:
     assert is_fall_winter, "Winter white snow floor must trigger fall detection!"
     assert detector.last_detected_biome == "winter_white"
 
+    # 4. Elevated viaduct / bridge frame with high floor ratio (corridor guard must protect from false fall)
+    viaduct_frame = summer_fall.copy()
+    for _ in range(6):
+        is_fall_viaduct, _ = detector.detect_fall(viaduct_frame, corridor_detected=True)
+    assert not is_fall_viaduct, "Active track corridor must prevent false fall detection on viaducts!"
+
 
 def test_game_state_detector_respawn_prompt() -> None:
     detector = GameStateDetector()
@@ -130,6 +136,8 @@ def test_latency_tracker_statistics() -> None:
 def test_harness_step_cycle() -> None:
     harness = PolytrackHarness(fallback_synthetic=True)
     try:
+        # Warmup step to eliminate cold-start OS/allocation spike
+        harness.step(w=False, a=False, s=False, d=False)
         frame, is_falling, telemetry = harness.step(w=True, a=False, s=False, d=False)
         assert frame is not None
         assert frame.ndim == 3

@@ -22,15 +22,18 @@ if "%gens%"=="" set gens=10
 set /p pop="Размер популяции [по умолчанию 8]: "
 if "%pop%"=="" set pop=8
 
+set /p frames="Длительность заезда в кадрах [по умолчанию 900 (~20 сек + овертайм)]: "
+if "%frames%"=="" set frames=900
+
 if "%mode%"=="2" (
     echo.
-    echo Запуск синтетического обучения: %gens% поколений, %pop% кандидатов...
-    python trainer.py --generations %gens% --population %pop%
+    echo Запуск синтетического обучения: %gens% поколений, %pop% кандидатов, %frames% кадров...
+    python trainer.py --generations %gens% --population %pop% --max-frames %frames%
 ) else (
     echo.
-    echo Запуск обучения на живой игре Polytrack: %gens% поколений, %pop% кандидатов...
+    echo Запуск обучения на живой игре Polytrack: %gens% поколений, %pop% кандидатов, %frames% кадров...
     echo Переключитесь на окно игры Polytrack!
-    python trainer.py --live --generations %gens% --population %pop%
+    python trainer.py --live --generations %gens% --population %pop% --max-frames %frames%
 )
 
 echo.

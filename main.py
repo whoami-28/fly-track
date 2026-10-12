@@ -35,6 +35,7 @@ from fly_brain import BrainInferenceOutput, FlyBrain
 from game_harness import PolytrackHarness, ScreenCapture
 from neural_overlay import NeuralOverlayController
 from retina import DrosophilaRetina, RetinaOutput
+from telemetry_logger import FlightRecorder
 
 logger = logging.getLogger("PolytrackFlyMain")
 logging.basicConfig(
@@ -53,10 +54,12 @@ class PolytrackOrchestrator:
         weights_path: Optional[Path] = None,
         device: str = config.DEVICE,
         show_overlay: bool = True,
+        enable_telemetry: bool = True,
     ) -> None:
         self.use_synthetic = use_synthetic
         self.device = device
         self.show_overlay = show_overlay
+        self.enable_telemetry = enable_telemetry
 
         # Initialize core components
         logger.info("Initializing Polytrack Game Harness...")
@@ -82,6 +85,14 @@ class PolytrackOrchestrator:
             target_hwnd = getattr(getattr(self.harness, "capture", None), "hwnd", 0)
             self.overlay = NeuralOverlayController(target_hwnd=target_hwnd)
             self.overlay.start()
+
+        # Telemetry Flight Recorder
+        self.recorder: Optional[FlightRecorder] = None
+        if self.enable_telemetry:
+            self.recorder = FlightRecorder(mode="autopilot")
+            self.recorder.start_episode(episode_id=1)
+        self.current_episode: int = 1
+        self.cumulative_distance: float = 0.0
 
         # Runtime control states
         self.is_paused: bool = False
@@ -179,6 +190,23 @@ class PolytrackOrchestrator:
             input_ms = 0.0
             self.harness.inputs.release_all()
 
+        # Update distance tracker
+        self.cumulative_distance += max(0.0, float(retina_out.lptc_vs_forward) * 100.0)
+
+        # Record telemetry frame
+        if self.recorder and self.recorder.is_recording:
+            dec_state = self.brain.get_decoder_state()
+            self.recorder.record_frame(
+                frame_idx=self.episode_frames,
+                elapsed_sec=time.time() - self.episode_start_time,
+                boundary=boundary_out,
+                retina=retina_out,
+                brain=brain_out,
+                actions=actions,
+                action_probs=brain_out.action_probabilities,
+                decoder_state=dec_state,
+            )
+
         # Handle terminal conditions (Warmup grace period: first 60 frames ~1.0-1.5s protected)
         self.episode_frames += 1
         if self.episode_frames > 60:
@@ -227,6 +255,20 @@ class PolytrackOrchestrator:
                 else:
                     reason = "FALL OFF TRACK"
                 logger.warning(f"Terminal condition detected ({reason})! Terminating attempt and resetting ('r')...")
+
+                if self.recorder and self.recorder.is_recording:
+                    term_key = reason.lower().replace(" ", "_").replace("(", "").replace(")", "")
+                    log_file = self.recorder.end_episode(
+                        death_reason=term_key,
+                        distance=self.cumulative_distance,
+                        avg_speed=self.cumulative_distance / max(1, self.episode_frames),
+                    )
+                    if log_file:
+                        logger.info(f"[TELEMETRY] Лог заезда сохранён в: {log_file}")
+                    self.current_episode += 1
+                    self.cumulative_distance = 0.0
+                    self.recorder.start_episode(episode_id=self.current_episode)
+
                 if not self.use_synthetic:
                     self.harness.inputs.reset_game()
                 self.brain.reset()
@@ -526,6 +568,8 @@ class PolytrackOrchestrator:
         finally:
             if self.overlay:
                 self.overlay.stop()
+            if self.recorder and self.recorder.is_active:
+                self.recorder.end_episode(death_reason="user_exit")
             self.harness.inputs.release_all()
             cv2.destroyAllWindows()
             print("\nClosed-loop agent stopped. All keyboard inputs released safely.\n")
@@ -538,6 +582,7 @@ def main() -> None:
     parser.add_argument("--weights", type=str, default=None, help="Path to trained plastic brain weights (.pt)")
     parser.add_argument("--calibrate", action="store_true", help="Calibrate Polytrack desktop window before running")
     parser.add_argument("--no-overlay", action="store_true", help="Disable in-game neural network overlay")
+    parser.add_argument("--no-telemetry", action="store_true", help="Disable flight-recorder telemetry logging")
 
     args = parser.parse_args()
 
@@ -550,6 +595,7 @@ def main() -> None:
         use_synthetic=args.synthetic,
         weights_path=Path(args.weights) if args.weights else None,
         show_overlay=not args.no_overlay,
+        enable_telemetry=not args.no_telemetry,
     )
     orchestrator.run()
 

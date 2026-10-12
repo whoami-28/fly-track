@@ -133,7 +133,7 @@ class TrackBoundaryDetector:
             car_x2 = int(w * 0.57)
             curb_mask[car_y:, car_x1:car_x2] = 0
 
-        # 4. Adaptive horizontal scanline boundary extraction
+        # 4. Adaptive horizontal scanline boundary extraction (Bottom-up: wheels -> horizon)
         mid_x = w // 2
         left_curb_pts: List[Tuple[int, int]] = []
         right_curb_pts: List[Tuple[int, int]] = []
@@ -144,7 +144,8 @@ class TrackBoundaryDetector:
 
         corridor_rows: List[Tuple[int, int, int, int]] = []  # (lx, rx, cx, row_y)
 
-        for y_rel in range(0, roi_height, self.scan_step_y):
+        # Scan bottom-up: start directly in front of the car wheels and track upwards to horizon
+        for y_rel in range(roi_height - 1, -1, -self.scan_step_y):
             row_y = y_min + y_rel
             row = curb_mask[y_rel, :]
 
@@ -163,7 +164,7 @@ class TrackBoundaryDetector:
                     rx = int(curb_indices[diffs[-1] + 1])
                     if (rx - lx) >= self.min_corridor_width_px:
                         cx = (lx + rx) // 2
-                        if prev_cx is None or abs(cx - prev_cx) <= int(w * 0.15):
+                        if prev_cx is None or abs(cx - prev_cx) <= int(w * 0.18):
                             left_curb_pts.append((lx, row_y))
                             right_curb_pts.append((rx, row_y))
                             center_pts.append((cx, row_y))
@@ -194,8 +195,9 @@ class TrackBoundaryDetector:
         aperture_ratio = 1.0
 
         if len(corridor_rows) >= 4:
-            near_l, near_r, near_c_x, near_y = corridor_rows[-1]
-            far_l, far_r, far_c_x, far_y = corridor_rows[0]
+            # Bottom-up order: index 0 is near the car wheels, index -1 is furthest toward horizon
+            near_l, near_r, near_c_x, near_y = corridor_rows[0]
+            far_l, far_r, far_c_x, far_y = corridor_rows[-1]
 
             # Lookahead road heading angle (horizon zone)
             dx = far_c_x - near_c_x
@@ -205,8 +207,8 @@ class TrackBoundaryDetector:
                 track_heading_deg = float(np.clip(track_heading_deg, -90.0, 90.0))
 
             # Immediate road heading angle (near zone: 5-15m ahead)
-            near_step = max(2, len(corridor_rows) // 3)
-            imm_row = corridor_rows[-near_step]
+            near_step = min(len(corridor_rows) - 1, max(2, len(corridor_rows) // 3))
+            imm_row = corridor_rows[near_step]
             dx_imm = imm_row[2] - near_c_x
             dy_imm = near_y - imm_row[3]
             if dy_imm > 0:
@@ -251,9 +253,9 @@ class TrackBoundaryDetector:
                 constriction_risk = float(np.clip(max(1.0 - aperture_ratio, 0.6 if is_pinched else 0.0), 0.0, 1.0))
 
         elif len(left_curb_pts) >= 4 and len(right_curb_pts) < 4:
-            # Only left curb visible
-            near_l = left_curb_pts[-1]
-            far_l = left_curb_pts[0]
+            # Only left curb visible (bottom-up: index 0 is near car, index -1 is horizon)
+            near_l = left_curb_pts[0]
+            far_l = left_curb_pts[-1]
             dx = far_l[0] - near_l[0]
             dy = near_l[1] - far_l[1]
             if dy > 0:
@@ -283,9 +285,9 @@ class TrackBoundaryDetector:
             immediate_offset = lateral_offset
 
         elif len(right_curb_pts) >= 4 and len(left_curb_pts) < 4:
-            # Only right curb visible
-            near_r = right_curb_pts[-1]
-            far_r = right_curb_pts[0]
+            # Only right curb visible (bottom-up: index 0 is near car, index -1 is horizon)
+            near_r = right_curb_pts[0]
+            far_r = right_curb_pts[-1]
             dx = far_r[0] - near_r[0]
             dy = near_r[1] - far_r[1]
             if dy > 0:

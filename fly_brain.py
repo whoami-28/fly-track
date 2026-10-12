@@ -259,6 +259,8 @@ class PlasticMotorDecoder(nn.Module):
         self.active_steer: str = "none"  # "none", "a", "d"
         self.lockout_counter: int = 0    # Frames of neutral steering lockout when changing direction
         self.steer_hold_counter: int = 0 # Frames active steering key has been held
+        self.last_raw_steer_demand: float = 0.0
+        self.last_drift_rate: float = 0.0
         self._init_readout_weights()
 
     def reset(self) -> None:
@@ -269,6 +271,19 @@ class PlasticMotorDecoder(nn.Module):
         self.active_steer = "none"
         self.lockout_counter = 0
         self.steer_hold_counter = 0
+        self.last_raw_steer_demand = 0.0
+        self.last_drift_rate = 0.0
+
+    def get_decoder_state(self) -> Dict[str, Any]:
+        """Expose internal motor decoder state for telemetry flight recorder."""
+        return {
+            "raw_steer_demand": getattr(self, "last_raw_steer_demand", 0.0),
+            "smoothed_steer_demand": self.smoothed_steer_demand,
+            "drift_rate": getattr(self, "last_drift_rate", 0.0),
+            "active_steer": self.active_steer,
+            "lockout_counter": self.lockout_counter,
+            "steer_hold_counter": self.steer_hold_counter,
+        }
 
     def _init_readout_weights(self) -> None:
         """Initialize motor readout weights matching Drosophila descending physiology."""
@@ -360,7 +375,22 @@ class PlasticMotorDecoder(nn.Module):
             if prox_l > 0.50 and imm_norm >= -0.10 and far_norm < 0:
                 far_norm = min(0.0, far_norm * (1.0 - prox_l))
 
-            effective_heading = 0.65 * imm_norm + 0.35 * far_norm
+            # Two-Point Steering Primacy:
+            # 1. Road Under Wheels (imm_norm): dictates the physical steering angle RIGHT NOW.
+            #    If road under wheels is straight (|imm_norm| < 0.12), the wheels MUST stay centered.
+            #    Distant curvature must NEVER steer the car off a straight track!
+            # 2. Road on Far Horizon (far_norm): controls preview deceleration / throttle lift,
+            #    and only gently biases steering (15%) when the road under wheels is ALREADY curving
+            #    in the same direction and safely centered!
+            if abs(imm_norm) < 0.12:
+                # Road under wheels is straight: zero horizon steering influence!
+                effective_heading = imm_norm
+            elif (imm_norm * far_norm) < 0:
+                # Opposite directions (e.g. chicane S-bend): NEVER steer against the immediate turn!
+                effective_heading = imm_norm
+            else:
+                # Road is actively curving and aligned: subtle 15% lookahead for smooth apex tracking
+                effective_heading = 0.85 * imm_norm + 0.15 * far_norm
 
             # PD Damping: compute lateral drift rate (derivative) to counter overshooting center
             if self.prev_lateral_offset is not None:
@@ -368,6 +398,7 @@ class PlasticMotorDecoder(nn.Module):
             else:
                 drift_rate = 0.0
             self.prev_lateral_offset = float(boundary.lateral_offset)
+            self.last_drift_rate = drift_rate
 
             # Combined PD Steer demand: Proportional curb centering + Derivative damping + Heading guidance
             raw_steer_demand = float(
@@ -379,6 +410,8 @@ class PlasticMotorDecoder(nn.Module):
             # Deadband on straights: eliminate micro-oscillations and snaking/fish-tailing
             if abs(effective_heading) < 0.10 and abs(boundary.lateral_offset) < 0.10 and abs(raw_steer_demand) < 0.08:
                 raw_steer_demand = 0.0
+
+            self.last_raw_steer_demand = raw_steer_demand
 
             if smooth:
                 # EMA Temporal Smoothing: alpha = 0.35 provides smooth ~60ms damping against chatter
@@ -413,6 +446,9 @@ class PlasticMotorDecoder(nn.Module):
         else:
             self.smoothed_steer_demand = 0.80 * self.smoothed_steer_demand
             self.prev_lateral_offset = None
+            self.last_raw_steer_demand = 0.0
+            self.last_drift_rate = 0.0
+            far_norm = 0.0
 
         # Speed-Steering Coupling & Trail Deceleration:
         turn_severity = float(np.clip(abs(prob_a - prob_d), 0.0, 1.0))
@@ -420,10 +456,19 @@ class PlasticMotorDecoder(nn.Module):
         # DNb01 braking descending neurons (indices 6 and 7)
         dnb_activity = float(torch.clamp((mean_dn_spikes[0, 6] + mean_dn_spikes[0, 7]) * 0.5, 0.0, 1.0).item())
 
+        # Distant turn urgency: when a sharp turn looms far ahead (|far_norm| > 0.25),
+        # initiate preview deceleration / throttle lift so the car enters the turn under control!
+        far_turn_urgency = (
+            float(np.clip(abs(far_norm) - 0.25, 0.0, 1.0))
+            if (boundary is not None and getattr(boundary, "corridor_detected", False))
+            else 0.0
+        )
+
         decel_demand = float(
             (turn_severity * w_turn_decel * 0.40)
             + (constriction * w_constrict_brake * 0.55)
             + (dnb_activity * w_looming_dn * 0.40)
+            + (far_turn_urgency * w_turn_decel * 0.35)
         )
 
         # Modulate throttle and brake when entering severe chicanes or constricted passages
@@ -567,6 +612,10 @@ class FlyBrain(nn.Module):
         """Reset internal membrane potentials, spike buffers, and motor smoothing filters."""
         self.connectome_core.reset_state(batch_size=1)
         self.motor_decoder.reset()
+
+    def get_decoder_state(self) -> Dict[str, Any]:
+        """Expose internal motor decoder state for telemetry flight recorder."""
+        return self.motor_decoder.get_decoder_state()
 
     @torch.no_grad()
     def forward_frame(

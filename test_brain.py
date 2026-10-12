@@ -322,6 +322,38 @@ def test_motor_decoder_pd_damping() -> None:
     assert raw_with_d > 0.0, "D-term must reverse raw steer demand when vehicle rapidly approaches center line"
 
 
+def test_motor_decoder_near_road_primacy() -> None:
+    from boundary_detector import BoundaryPerceptionOutput
+    connectome = get_or_build_connectome()
+    decoder = PlasticMotorDecoder(connectome)
+    zero_rates = torch.zeros(1, 8)
+
+    # Road under wheels is completely straight (immediate_heading_deg = 0.0, lateral_offset = 0.0),
+    # BUT distant track on horizon turns sharply right (track_heading_deg = 45.0)!
+    b_bridge = BoundaryPerceptionOutput(
+        lateral_offset=0.0,
+        immediate_heading_deg=0.0,
+        track_heading_deg=45.0,
+        proximity_left=0.0,
+        proximity_right=0.0,
+        corridor_detected=True,
+    )
+
+    actions, probs = decoder.decode(zero_rates, vs_forward=0.2, boundary=b_bridge)
+
+    # The car MUST NOT prematurely turn right off the straight road into the abyss!
+    assert actions["d"] is False, "Car on straight road under wheels must NOT steer right toward distant horizon turn!"
+    assert actions["a"] is False
+    assert decoder.active_steer == "none"
+
+    # Verify get_decoder_state exposes valid telemetry dict
+    st = decoder.get_decoder_state()
+    assert isinstance(st, dict)
+    assert "raw_steer_demand" in st
+    assert "smoothed_steer_demand" in st
+    assert "active_steer" in st
+
+
 if __name__ == "__main__":
     print("Running FlyBrain unit tests...")
     test_plastic_input_adapter()

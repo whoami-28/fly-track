@@ -29,6 +29,7 @@ from fly_brain import FlyBrain
 from game_harness import PolytrackHarness, ScreenCapture
 from neural_overlay import NeuralOverlayController
 from retina import DrosophilaRetina
+from telemetry_logger import FlightRecorder
 
 logger = logging.getLogger("FlyTrainer")
 logging.basicConfig(
@@ -61,6 +62,7 @@ class EvolutionaryTrainer:
         enable_overtime: bool = True,
         max_overtime_cap: int = 2500,
         show_overlay: bool = True,
+        enable_telemetry: bool = True,
     ) -> None:
         self.pop_size = max(2, population_size)
         self.base_sigma = mutation_sigma
@@ -70,6 +72,7 @@ class EvolutionaryTrainer:
         self.max_overtime_cap = max_overtime_cap
         self.use_synthetic = use_synthetic
         self.show_overlay = show_overlay
+        self.enable_telemetry = enable_telemetry
         self.output_path = output_weights_path
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -85,6 +88,12 @@ class EvolutionaryTrainer:
             target_hwnd = getattr(getattr(self.harness, "capture", None), "hwnd", 0)
             self.overlay = NeuralOverlayController(target_hwnd=target_hwnd)
             self.overlay.start()
+
+        # Telemetry flight recorder
+        self.current_generation: int = 0
+        self.recorder: Optional[FlightRecorder] = None
+        if self.enable_telemetry:
+            self.recorder = FlightRecorder(mode="trainer")
 
         # Baseline parameter extraction
         self.n_params = len(self.brain.get_plastic_parameters())
@@ -165,6 +174,15 @@ class EvolutionaryTrainer:
         self.brain.set_plastic_parameters(candidate_params)
         self.brain.reset()
         self.retina.reset()
+
+        if self.recorder:
+            ep_id = f"g{self.current_generation}_c{candidate_idx}"
+            self.recorder.start_episode(
+                episode_id=ep_id,
+                generation=self.current_generation,
+                candidate_id=candidate_idx,
+                niche=niche,
+            )
 
         if not self.use_synthetic:
             self.harness.ensure_window_focus()
@@ -373,8 +391,21 @@ class EvolutionaryTrainer:
                     break
 
             # ---------------------------------------------------------
-            # 5. Actuation (WASD dispatch)
+            # 5. Telemetry recording & Actuation (WASD dispatch)
             # ---------------------------------------------------------
+            if self.recorder and self.recorder.is_recording:
+                dec_state = self.brain.get_decoder_state()
+                self.recorder.record_frame(
+                    frame_idx=total_frames,
+                    elapsed_sec=total_frames / 30.0,
+                    boundary=boundary_out,
+                    retina=retina_out,
+                    brain=brain_out,
+                    actions=brain_out.actions,
+                    action_probs=brain_out.action_probabilities,
+                    decoder_state=dec_state,
+                )
+
             if not self.use_synthetic:
                 self.harness.inputs.set_actions(
                     w=brain_out.actions["w"],
@@ -484,10 +515,21 @@ class EvolutionaryTrainer:
             "max_prompt_score": float(max_prompt_score),
             "is_champion": is_champion,
         }
+
+        # Flush telemetry episode to disk & master summary
+        if self.recorder and self.recorder.is_recording:
+            self.recorder.end_episode(
+                death_reason=death_reason,
+                fitness=float(fitness),
+                distance=total_distance,
+                avg_speed=avg_spd,
+            )
+
         return fitness, metrics
 
     def train_generation(self, gen_idx: int) -> Dict[str, Any]:
         """Execute one generation of Champion-Anchored Elitist Evolution."""
+        self.current_generation = gen_idx
         t_gen_start = time.perf_counter()
 
         # Build candidate population:
@@ -659,6 +701,7 @@ class EvolutionaryTrainer:
         if self.best_fitness == -float("inf") or needs_live_baseline:
             mode_tag = "в живой игре PolyTrack" if not self.use_synthetic else "на синтетическом треке"
             print(f"\n[КАЛИБРОВКА] Измерение реального базового уровня Чемпиона {mode_tag}...")
+            self.current_generation = 0
             base_fit, base_met = self.evaluate_candidate(self.best_params, candidate_idx=0, is_champion=True)
             self.best_fitness = base_fit
             self.best_generation = 0
@@ -682,6 +725,8 @@ class EvolutionaryTrainer:
         finally:
             if self.overlay:
                 self.overlay.stop()
+            if self.recorder and self.recorder.is_active:
+                self.recorder.end_episode(death_reason="user_exit")
             self.harness.inputs.release_all()
             print(f"\nTraining session complete.")
             print(f"Global Best Fitness Ever: {self.best_fitness:.2f} (Registered in Gen {self.best_generation})")
@@ -697,6 +742,7 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int, default=900, help="Max evaluation frames per episode")
     parser.add_argument("--sigma", type=float, default=config.EVOLUTION_MUTATION_SIGMA, help="Mutation sigma")
     parser.add_argument("--no-overlay", action="store_true", help="Disable in-game neural network overlay during training")
+    parser.add_argument("--no-telemetry", action="store_true", help="Disable flight-recorder telemetry logging during training")
 
     args = parser.parse_args()
 
@@ -706,6 +752,7 @@ def main() -> None:
         max_eval_frames=args.max_frames,
         use_synthetic=not args.live,
         show_overlay=not args.no_overlay,
+        enable_telemetry=not args.no_telemetry,
     )
     trainer.run(num_generations=args.generations)
 

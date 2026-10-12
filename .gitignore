@@ -24,4 +24,6 @@ calibration_config.json
 
 # Logs & temp benchmarks
 *.log
+logs/*.csv
+logs/telemetry/
 scratch/

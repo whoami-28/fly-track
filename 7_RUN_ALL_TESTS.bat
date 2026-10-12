@@ -43,8 +43,13 @@ python test_brain_manager.py
 if errorlevel 1 goto failed
 
 echo.
-echo [8/8] Тестирование системного контура и тренера (system & trainer)...
+echo [8/9] Тестирование системного контура и тренера (system & trainer)...
 python test_system.py
+if errorlevel 1 goto failed
+
+echo.
+echo [9/9] Тестирование бортового самописца телеметрии (telemetry_logger)...
+python -m pytest test_telemetry.py -q
 if errorlevel 1 goto failed
 
 echo.
